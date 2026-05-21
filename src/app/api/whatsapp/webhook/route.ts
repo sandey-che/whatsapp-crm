@@ -145,11 +145,15 @@ export async function GET(request: Request) {
 
 // POST - Receive messages
 export async function POST(request: Request) {
+  console.log('[webhook] POST request received at', new Date().toISOString())
+  
   // Read raw body first so we can HMAC-verify the exact bytes Meta
   // signed. request.json() would re-encode and break the signature.
   const rawBody = await request.text()
   const signature = request.headers.get('x-hub-signature-256')
 
+  console.log('[webhook] Signature present:', !!signature)
+  
   if (!verifyMetaWebhookSignature(rawBody, signature)) {
     // 401 (not 200) — we want Meta's delivery dashboard to show failures
     // loudly if a misconfiguration causes signatures to stop matching,
@@ -158,12 +162,17 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
   }
 
+  console.log('[webhook] Signature verified ✓')
+
   let body: { entry?: WhatsAppWebhookEntry[] }
   try {
     body = JSON.parse(rawBody)
-  } catch {
+  } catch (err) {
+    console.error('[webhook] Failed to parse JSON:', err)
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
   }
+
+  console.log('[webhook] Event body parsed. Entries:', body.entry?.length ?? 0)
 
   // Process asynchronously so we can ack Meta within their timeout.
   processWebhook(body).catch((error) => {
@@ -174,23 +183,36 @@ export async function POST(request: Request) {
 }
 
 async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
-  if (!body.entry) return
+  if (!body.entry) {
+    console.log('[webhook] No entries in body')
+    return
+  }
+
+  console.log('[webhook] Processing', body.entry.length, 'entries')
 
   for (const entry of body.entry) {
+    console.log('[webhook] Processing entry:', entry.id)
     for (const change of entry.changes) {
       const value = change.value
 
       // Handle status updates
       if (value.statuses) {
+        console.log('[webhook] Processing', value.statuses.length, 'status updates')
         for (const status of value.statuses) {
           await handleStatusUpdate(status)
         }
       }
 
       // Handle incoming messages
-      if (!value.messages || !value.contacts) continue
+      if (!value.messages || !value.contacts) {
+        console.log('[webhook] No messages or contacts in this change')
+        continue
+      }
+
+      console.log('[webhook] Incoming messages:', value.messages.length)
 
       const phoneNumberId = value.metadata.phone_number_id
+      console.log('[webhook] Phone number ID:', phoneNumberId)
 
       // Find user's config by phone_number_id
       const { data: config, error: configError } = await supabaseAdmin()
@@ -200,15 +222,19 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         .single()
 
       if (configError || !config) {
-        console.error('No config found for phone_number_id:', phoneNumberId)
+        console.error('[webhook] No config found for phone_number_id:', phoneNumberId, configError)
         continue
       }
+
+      console.log('[webhook] Config found for user:', config.user_id)
 
       const decryptedAccessToken = decrypt(config.access_token)
 
       for (let i = 0; i < value.messages.length; i++) {
         const message = value.messages[i]
         const contact = value.contacts[i] || value.contacts[0]
+
+        console.log('[webhook] Processing message:', message.id, 'from:', message.from, 'type:', message.type)
 
         await processMessage(
           message,
