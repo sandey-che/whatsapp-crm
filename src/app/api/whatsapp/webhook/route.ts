@@ -174,10 +174,14 @@ export async function POST(request: Request) {
 
   console.log('[webhook] Event body parsed. Entries:', body.entry?.length ?? 0)
 
-  // Process asynchronously so we can ack Meta within their timeout.
-  processWebhook(body).catch((error) => {
+  // Process synchronously. Vercel Serverless Functions freeze execution
+  // immediately after a response is returned. By awaiting here, we ensure
+  // database inserts complete before the container goes to sleep.
+  try {
+    await processWebhook(body)
+  } catch (error) {
     console.error('Error processing webhook:', error)
-  })
+  }
 
   return NextResponse.json({ status: 'received' }, { status: 200 })
 }
@@ -204,8 +208,13 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
       }
 
       // Handle incoming messages
-      if (!value.messages || !value.contacts) {
-        console.log('[webhook] No messages or contacts in this change')
+      if (!value.messages || value.messages.length === 0) {
+        console.log('[webhook] No messages in this change')
+        continue
+      }
+
+      if (!value.contacts || value.contacts.length === 0) {
+        console.log('[webhook] Warning: messages present but no contacts data. Skipping message processing.')
         continue
       }
 
@@ -232,7 +241,32 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       for (let i = 0; i < value.messages.length; i++) {
         const message = value.messages[i]
-        const contact = value.contacts[i] || value.contacts[0]
+        
+        // Handle missing contacts array — create a synthetic contact from message data
+        let contact = value.contacts?.[i] || value.contacts?.[0]
+        
+        if (!contact) {
+          // Contacts array is missing or empty — look up contact by phone number from message.from
+          console.log('[webhook] No contacts in payload, looking up contact by phone:', message.from)
+          
+          const { data: foundContact, error: contactErr } = await supabaseAdmin()
+            .from('contacts')
+            .select('id, phone, name, email')
+            .eq('phone', message.from)
+            .eq('user_id', config.user_id)
+            .maybeSingle()
+          
+          if (contactErr || !foundContact) {
+            console.warn('[webhook] Contact not found for phone:', message.from, contactErr)
+            // Create a temporary contact object so message processing doesn't fail
+            contact = {
+              wa_id: message.from,
+              profile: { name: `Contact ${message.from}` }
+            }
+          } else {
+            contact = foundContact
+          }
+        }
 
         console.log('[webhook] Processing message:', message.id, 'from:', message.from, 'type:', message.type)
 
@@ -606,15 +640,19 @@ async function processMessage(
   if (contactOutcome.wasCreated) automationTriggers.unshift('new_contact_created')
   if (isFirstInboundMessage) automationTriggers.unshift('first_inbound_message')
   for (const triggerType of automationTriggers) {
-    runAutomationsForTrigger({
-      userId,
-      triggerType,
-      contactId: contactRecord.id,
-      context: {
-        message_text: inboundText,
-        conversation_id: conversation.id,
-      },
-    }).catch((err) => console.error('[automations] dispatch failed:', err))
+    try {
+      await runAutomationsForTrigger({
+        userId,
+        triggerType,
+        contactId: contactRecord.id,
+        context: {
+          message_text: inboundText,
+          conversation_id: conversation.id,
+        },
+      })
+    } catch (err) {
+      console.error('[automations] dispatch failed:', err)
+    }
   }
 }
 
