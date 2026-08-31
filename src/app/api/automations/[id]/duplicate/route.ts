@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { supabaseAdmin } from '@/lib/automations/admin-client'
 
 export async function POST(
@@ -7,6 +8,16 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params
+
+  // Duplicating creates a new automation row — a write. Enforce `agent`
+  // (the service-role client below bypasses the agent-gated
+  // automations_insert RLS).
+  try {
+    await requireRole('agent')
+  } catch (err) {
+    return toErrorResponse(err)
+  }
+
   const supabase = await createClient()
   const {
     data: { user },
@@ -26,6 +37,9 @@ export async function POST(
   const { data: copy, error: copyErr } = await admin
     .from('automations')
     .insert({
+      // Clone into the same account as the original. account_id is NOT
+      // NULL post-017, so the INSERT fails the constraint without it.
+      account_id: original.account_id,
       user_id: user.id,
       name: `${original.name} (Copy)`,
       description: original.description,

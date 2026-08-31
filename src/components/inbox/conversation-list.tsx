@@ -2,18 +2,24 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { createClient } from "@/lib/supabase/client";
+import {
+  CONVERSATION_SELECT,
+  matchesContactFilters,
+  normalizeConversations,
+} from "@/lib/inbox/conversations";
 import { cn } from "@/lib/utils";
-import type { Conversation, ConversationStatus, Contact } from "@/types";
-import { Search, ChevronDown, Plus } from "lucide-react";
+import type { Conversation, ConversationStatus, Tag, Contact} from "@/types";
+import { Search, ChevronDown, X, Plus } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
+import { useTranslations } from "next-intl";
 import { Input } from "@/components/ui/input";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { NewConversationModal } from "./new-conversation-modal";
 
@@ -22,30 +28,51 @@ interface ConversationListProps {
   onSelect: (conversation: Conversation) => void;
   conversations: Conversation[];
   onConversationsLoaded: (conversations: Conversation[]) => void;
+  /**
+   * Increment to force the fetch effect below to refire. The parent
+   * bumps this on realtime reconnect / tab visibility → visible so the
+   * list catches up on any events sent while the WS was disconnected
+   * or the tab was throttled. Optional so existing callers keep working.
+   */
+  resyncToken?: number;
 }
 
 const STATUS_COLORS: Record<ConversationStatus, string> = {
-  open: "bg-violet-500",
+  open: "bg-primary",
   pending: "bg-amber-500",
-  closed: "bg-slate-500",
+  closed: "bg-muted-foreground",
 };
 
-const FILTER_OPTIONS: { label: string; value: ConversationStatus | "all" }[] = [
-  { label: "All", value: "all" },
-  { label: "Open", value: "open" },
-  { label: "Pending", value: "pending" },
-  { label: "Closed", value: "closed" },
-];
+
+
+type InboxFilter = ConversationStatus | "all" | "unread";
 
 export function ConversationList({
   activeConversationId,
   onSelect,
   conversations,
   onConversationsLoaded,
+  resyncToken = 0,
 }: ConversationListProps) {
+  const t = useTranslations("Inbox.conversationList");
+  
+  const FILTER_OPTIONS: { label: string; value: InboxFilter }[] = useMemo(() => [
+    { label: t("filterAll"), value: "all" },
+    { label: t("filterUnread"), value: "unread" },
+    { label: t("filterOpen"), value: "open" },
+    { label: t("filterPending"), value: "pending" },
+    { label: t("filterClosed"), value: "closed" },
+  ], [t]);
+
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<ConversationStatus | "all">("all");
+  const [filter, setFilter] = useState<InboxFilter>("all");
   const [loading, setLoading] = useState(true);
+  // Contact-based filters (issue #272). Tags use OR logic (a conversation
+  // matches if its contact carries any selected tag), consistent with
+  // Broadcast audience filtering. Company is an exact match on the field.
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
+  const [selectedCompany, setSelectedCompany] = useState<string | null>(null);
   const [newConversationModalOpen, setNewConversationModalOpen] = useState(false);
 
   // Keep the latest callback in a ref so the fetch effect below can
@@ -72,7 +99,7 @@ export function ConversationList({
     (async () => {
       const { data, error } = await supabase
         .from("conversations")
-        .select("*, contact:contacts(*)")
+        .select(CONVERSATION_SELECT)
         .order("last_message_at", { ascending: false });
 
       if (cancelled) return;
@@ -89,20 +116,67 @@ export function ConversationList({
         return;
       }
 
-      onConversationsLoadedRef.current(data ?? []);
+      onConversationsLoadedRef.current(normalizeConversations(data ?? []));
       setLoading(false);
     })();
 
     return () => {
       cancelled = true;
     };
+    // `resyncToken` is included so the parent can force a refetch when
+    // the realtime channel reconnects or the tab regains focus — catches
+    // up on any events sent while the WS was disconnected or throttled.
+  }, [resyncToken]);
+
+  // Tag definitions for the filter picker — loaded once so labels/colours
+  // stay stable regardless of which conversations happen to be loaded.
+  useEffect(() => {
+    const supabase = createClient();
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase.from("tags").select("*").order("name");
+      if (!cancelled && data) setTags(data as Tag[]);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // Company options are derived from the loaded conversations — there's no
+  // separate companies table, and only companies with a live conversation
+  // are worth offering as an inbox filter.
+  const companies = useMemo(() => {
+    const set = new Set<string>();
+    for (const c of conversations) {
+      const co = c.contact?.company?.trim();
+      if (co) set.add(co);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [conversations]);
+
+  const tagsById = useMemo(() => {
+    const m = new Map<string, Tag>();
+    for (const t of tags) m.set(t.id, t);
+    return m;
+  }, [tags]);
 
   const filtered = useMemo(() => {
     let result = conversations;
 
-    if (filter !== "all") {
+    if (filter === "unread") {
+      result = result.filter((c) => c.unread_count > 0);
+    } else if (filter !== "all") {
       result = result.filter((c) => c.status === filter);
+    }
+
+    // Contact-based filters (tags via OR logic, exact company match).
+    if (selectedTagIds.length > 0 || selectedCompany !== null) {
+      result = result.filter((c) =>
+        matchesContactFilters(c, {
+          tagIds: selectedTagIds,
+          company: selectedCompany,
+        })
+      );
     }
 
     if (search.trim()) {
@@ -116,7 +190,20 @@ export function ConversationList({
     }
 
     return result;
-  }, [conversations, filter, search]);
+  }, [conversations, filter, search, selectedTagIds, selectedCompany]);
+
+  const toggleTag = useCallback((id: string) => {
+    setSelectedTagIds((prev) =>
+      prev.includes(id) ? prev.filter((t) => t !== id) : [...prev, id]
+    );
+  }, []);
+
+  const clearContactFilters = useCallback(() => {
+    setSelectedTagIds([]);
+    setSelectedCompany(null);
+  }, []);
+
+  const hasContactFilters = selectedTagIds.length > 0 || selectedCompany !== null;
 
   const handleSearchChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -206,42 +293,174 @@ export function ConversationList({
           </Button>
         </div>
 
-        <DropdownMenu>
-          <DropdownMenuTrigger className="inline-flex items-center justify-center h-7 gap-1 px-2 text-xs text-slate-400 hover:text-white rounded-md hover:bg-slate-800">
-              {activeFilter?.label ?? "All"}
-              <ChevronDown className="h-3 w-3" />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent
-            align="start"
-            className="border-slate-700 bg-slate-800"
-          >
-            {FILTER_OPTIONS.map((opt) => (
-              <DropdownMenuItem
-                key={opt.value}
-                onClick={() => setFilter(opt.value)}
+        <div className="flex flex-wrap items-center gap-1">
+          <DropdownMenu>
+            <DropdownMenuTrigger className="inline-flex items-center justify-center h-7 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground rounded-md hover:bg-muted">
+                {activeFilter?.label ?? t("filterAll")}
+                <ChevronDown className="h-3 w-3" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="border-border bg-popover"
+            >
+              {FILTER_OPTIONS.map((opt) => (
+                <DropdownMenuItem
+                  key={opt.value}
+                  onClick={() => setFilter(opt.value)}
+                  className={cn(
+                    "text-sm",
+                    filter === opt.value
+                      ? "text-primary"
+                      : "text-popover-foreground"
+                  )}
+                >
+                  {opt.label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          {tags.length > 0 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
                 className={cn(
-                  "text-sm",
-                  filter === opt.value
-                    ? "text-violet-400"
-                    : "text-slate-300"
+                  "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
+                  selectedTagIds.length > 0
+                    ? "text-primary"
+                    : "text-muted-foreground hover:text-foreground"
                 )}
               >
-                {opt.label}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
+                {t("tags")}
+                {selectedTagIds.length > 0 && (
+                  <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">
+                    {selectedTagIds.length}
+                  </span>
+                )}
+                <ChevronDown className="h-3 w-3" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                className="max-h-64 w-56 border-border bg-popover"
+              >
+                {tags.map((t) => (
+                  <DropdownMenuCheckboxItem
+                    key={t.id}
+                    checked={selectedTagIds.includes(t.id)}
+                    onCheckedChange={() => toggleTag(t.id)}
+                    className="text-sm text-popover-foreground"
+                  >
+                    <span className="flex items-center gap-2">
+                      <span
+                        className="h-2 w-2 shrink-0 rounded-full"
+                        style={{ backgroundColor: t.color }}
+                      />
+                      <span className="truncate">{t.name}</span>
+                    </span>
+                  </DropdownMenuCheckboxItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+
+          {companies.length > 0 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                className={cn(
+                  "inline-flex max-w-40 items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
+                  selectedCompany
+                    ? "text-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                )}
+              >
+                <span className="truncate">{selectedCompany ?? t("company")}</span>
+                <ChevronDown className="h-3 w-3 shrink-0" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                className="max-h-64 w-56 border-border bg-popover"
+              >
+                <DropdownMenuItem
+                  onClick={() => setSelectedCompany(null)}
+                  className={cn(
+                    "text-sm",
+                    selectedCompany === null
+                      ? "text-primary"
+                      : "text-popover-foreground"
+                  )}
+                >
+                  {t("allCompanies")}
+                </DropdownMenuItem>
+                {companies.map((co) => (
+                  <DropdownMenuItem
+                    key={co}
+                    onClick={() => setSelectedCompany(co)}
+                    className={cn(
+                      "text-sm",
+                      selectedCompany === co
+                        ? "text-primary"
+                        : "text-popover-foreground"
+                    )}
+                  >
+                    <span className="truncate">{co}</span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
+
+        {hasContactFilters && (
+          <div className="flex flex-wrap items-center gap-1">
+            {selectedTagIds.map((id) => {
+              const tag = tagsById.get(id);
+              return (
+                <button
+                  key={id}
+                  onClick={() => toggleTag(id)}
+                  className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[11px] text-foreground hover:bg-muted/70"
+                >
+                  <span
+                    className="h-1.5 w-1.5 shrink-0 rounded-full"
+                    style={{ backgroundColor: tag?.color ?? "var(--muted-foreground)" }}
+                  />
+                  <span className="max-w-24 truncate">{tag?.name ?? t("tags")}</span>
+                  <X className="h-3 w-3" />
+                </button>
+              );
+            })}
+            {selectedCompany && (
+              <button
+                onClick={() => setSelectedCompany(null)}
+                className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[11px] text-foreground hover:bg-muted/70"
+              >
+                <span className="max-w-24 truncate">{selectedCompany}</span>
+                <X className="h-3 w-3" />
+              </button>
+            )}
+            <button
+              onClick={clearContactFilters}
+              className="px-1 text-[11px] text-muted-foreground hover:text-foreground"
+            >
+              {t("clearAll")}
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Conversation Items */}
-      <ScrollArea className="flex-1">
+      {/* Conversation Items.
+          `min-h-0` is load-bearing: a flex child defaults to
+          min-height:auto, so without it this ScrollArea grows to fit
+          every conversation instead of shrinking to the remaining
+          space — the list then overflows and gets clipped by the
+          parent's overflow-hidden with no scrollbar (issue #229). */}
+      <ScrollArea className="min-h-0 flex-1">
         {loading ? (
           <div className="flex items-center justify-center py-12">
-            <div className="h-5 w-5 animate-spin rounded-full border-2 border-violet-500 border-t-transparent" />
+            <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
           </div>
         ) : filtered.length === 0 ? (
           <div className="px-4 py-12 text-center">
-            <p className="text-sm text-slate-500">No conversations found</p>
+            <p className="text-sm text-muted-foreground">{t("noConversations")}</p>
           </div>
         ) : (
           <div className="flex flex-col">
@@ -251,6 +470,7 @@ export function ConversationList({
                 conversation={conv}
                 isActive={conv.id === activeConversationId}
                 onSelect={handleSelect}
+                t={t}
               />
             ))}
           </div>
@@ -271,15 +491,17 @@ interface ConversationItemProps {
   conversation: Conversation;
   isActive: boolean;
   onSelect: (conversation: Conversation) => void;
+  t: ReturnType<typeof useTranslations>;
 }
 
 function ConversationItem({
   conversation,
   isActive,
   onSelect,
+  t,
 }: ConversationItemProps) {
   const contact = conversation.contact;
-  const displayName = contact?.name || contact?.phone || "Unknown";
+  const displayName = contact?.name || contact?.phone || t("unknown");
   const initials = displayName.charAt(0).toUpperCase();
 
   const handleClick = useCallback(() => {
@@ -296,12 +518,12 @@ function ConversationItem({
     <button
       onClick={handleClick}
       className={cn(
-        "flex w-full items-start gap-3 px-3 py-3 text-left transition-colors hover:bg-slate-800/50",
-        isActive && "border-l-2 border-violet-500 bg-slate-800/70"
+        "flex w-full items-start gap-3 px-3 py-3 text-left transition-colors hover:bg-muted/50",
+        isActive && "border-l-2 border-primary bg-muted/70"
       )}
     >
       {/* Avatar */}
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-slate-700 text-sm font-medium text-white">
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground">
         {contact?.avatar_url ? (
           <img
             src={contact.avatar_url}
@@ -316,18 +538,18 @@ function ConversationItem({
       {/* Content */}
       <div className="min-w-0 flex-1">
         <div className="flex items-center justify-between gap-2">
-          <span className="truncate text-sm font-medium text-white">
+          <span className="truncate text-sm font-medium text-foreground">
             {displayName}
           </span>
-          <span className="shrink-0 text-[10px] text-slate-500">{timeAgo}</span>
+          <span className="shrink-0 text-[10px] text-muted-foreground">{timeAgo}</span>
         </div>
         <div className="mt-0.5 flex items-center justify-between gap-2">
-          <p className="truncate text-xs text-slate-400">
-            {conversation.last_message_text || "No messages yet"}
+          <p className="truncate text-xs text-muted-foreground">
+            {conversation.last_message_text || t("noMessagesYet")}
           </p>
           <div className="flex shrink-0 items-center gap-1.5">
             {conversation.unread_count > 0 && (
-              <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-violet-500 px-1 text-[10px] font-bold text-white">
+              <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">
                 {conversation.unread_count}
               </span>
             )}
