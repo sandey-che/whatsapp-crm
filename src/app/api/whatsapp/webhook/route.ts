@@ -181,11 +181,15 @@ export async function GET(request: Request) {
 
 // POST - Receive messages
 export async function POST(request: Request) {
+  console.log('[webhook] POST request received at', new Date().toISOString())
+  
   // Read raw body first so we can HMAC-verify the exact bytes Meta
   // signed. request.json() would re-encode and break the signature.
   const rawBody = await request.text()
   const signature = request.headers.get('x-hub-signature-256')
 
+  console.log('[webhook] Signature present:', !!signature)
+  
   if (!verifyMetaWebhookSignature(rawBody, signature)) {
     // 401 (not 200) — we want Meta's delivery dashboard to show failures
     // loudly if a misconfiguration causes signatures to stop matching,
@@ -194,10 +198,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
   }
 
+  console.log('[webhook] Signature verified ✓')
+
   let body: { entry?: WhatsAppWebhookEntry[] }
   try {
     body = JSON.parse(rawBody)
-  } catch {
+  } catch (err) {
+    console.error('[webhook] Failed to parse JSON:', err)
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
   }
 
@@ -227,9 +234,15 @@ export async function POST(request: Request) {
 }
 
 async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
-  if (!body.entry) return
+  if (!body.entry) {
+    console.log('[webhook] No entries in body')
+    return
+  }
+
+  console.log('[webhook] Processing', body.entry.length, 'entries')
 
   for (const entry of body.entry) {
+    console.log('[webhook] Processing entry:', entry.id)
     for (const change of entry.changes) {
       // Template-lifecycle events (status / quality / components
       // updates from Meta) come in on a different change.field and
@@ -248,15 +261,27 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       // Handle status updates
       if (value.statuses) {
+        console.log('[webhook] Processing', value.statuses.length, 'status updates')
         for (const status of value.statuses) {
           await handleStatusUpdate(status)
         }
       }
 
       // Handle incoming messages
-      if (!value.messages || !value.contacts) continue
+      if (!value.messages || value.messages.length === 0) {
+        console.log('[webhook] No messages in this change')
+        continue
+      }
+
+      if (!value.contacts || value.contacts.length === 0) {
+        console.log('[webhook] Warning: messages present but no contacts data. Skipping message processing.')
+        continue
+      }
+
+      console.log('[webhook] Incoming messages:', value.messages.length)
 
       const phoneNumberId = value.metadata.phone_number_id
+      console.log('[webhook] Phone number ID:', phoneNumberId)
 
       // Find user's config by phone_number_id. `.single()` returns
       // PGRST116 for both 0 rows AND ≥2 rows — distinguish them so
@@ -299,7 +324,34 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       for (let i = 0; i < value.messages.length; i++) {
         const message = value.messages[i]
-        const contact = value.contacts[i] || value.contacts[0]
+        
+        // Handle missing contacts array — create a synthetic contact from message data
+        let contact = value.contacts?.[i] || value.contacts?.[0]
+        
+        if (!contact) {
+          // Contacts array is missing or empty — look up contact by phone number from message.from
+          console.log('[webhook] No contacts in payload, looking up contact by phone:', message.from)
+          
+          const { data: foundContact, error: contactErr } = await supabaseAdmin()
+            .from('contacts')
+            .select('id, phone, name, email')
+            .eq('phone', message.from)
+            .eq('user_id', config.user_id)
+            .maybeSingle()
+          
+          if (contactErr || !foundContact) {
+            console.warn('[webhook] Contact not found for phone:', message.from, contactErr)
+            // Create a temporary contact object so message processing doesn't fail
+            contact = {
+              wa_id: message.from,
+              profile: { name: `Contact ${message.from}` }
+            }
+          } else {
+            contact = foundContact
+          }
+        }
+
+        console.log('[webhook] Processing message:', message.id, 'from:', message.from, 'type:', message.type)
 
         await processMessage(
           message,

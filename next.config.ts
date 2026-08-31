@@ -98,6 +98,20 @@ const nextConfig: NextConfig = {
   ],
 
   /**
+   * Allow ngrok tunnel and other development origins for HMR.
+   * This is needed when using ngrok for webhook development.
+   */
+  ...(process.env.NODE_ENV === 'development' && {
+    allowedDevOrigins: [
+      'localhost',
+      '127.0.0.1',
+      '192.168.1.41',
+      // ngrok domains
+      'startup-cane-scallop.ngrok-free.dev',
+    ],
+  }),
+
+  /**
    * Cache-Control policy.
    *
    * Why this exists:
