@@ -12,6 +12,7 @@ import type { Conversation, ConversationStatus, Tag, Contact} from "@/types";
 import { Search, ChevronDown, X, Plus } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { useTranslations } from "next-intl";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   DropdownMenu,
