@@ -8,6 +8,10 @@ broadcasts — without going through the dashboard UI.
 > messages / contacts / conversations / broadcasts endpoints, and
 > outbound event [webhooks](#webhooks) all ship now.
 
+> **Machine-readable spec:** [`openapi.yaml`](./openapi.yaml) (OpenAPI
+> 3.1). Lint with `npx @redocly/cli lint docs/openapi.yaml`; preview
+> with `npx @redocly/cli preview-docs docs/openapi.yaml`.
+
 ## Authentication
 
 Every request authenticates with an **API key**, sent as a bearer
