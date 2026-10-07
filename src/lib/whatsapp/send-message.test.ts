@@ -182,10 +182,18 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
   isLegacyFormat: () => false,
 }));
 
+// Rows written to message_logs (via the service-role client).
+const logged: Record<string, unknown>[] = [];
+
 vi.mock('@/lib/flows/admin-client', () => ({
-  // Only used for the best-effort "pause active flow run" write.
+  // Used for the best-effort "pause active flow run" write and the
+  // message_logs audit inserts.
   supabaseAdmin: () => ({
-    from: () => ({
+    from: (table: string) => ({
+      insert: async (row: Record<string, unknown>) => {
+        if (table === 'message_logs') logged.push(row);
+        return { error: null };
+      },
       update: () => ({
         eq: () => ({ eq: () => ({ eq: async () => ({ error: null }) }) }),
       }),
@@ -344,5 +352,122 @@ describe('sendMessageToConversation — template persistence (#483)', () => {
     // name rather than inventing a body.
     expect(captured.message?.content_text).toBeNull();
     expect(captured.conversation?.last_message_text).toBe('[template]');
+  });
+});
+
+// ============================================================
+// Audit trail — message_logs (migration 040).
+// ============================================================
+
+describe('sendMessageToConversation — message_logs audit', () => {
+  it('logs a Meta rejection with the complete error and records a failed message', async () => {
+    const { MetaApiError } = await import('@/lib/whatsapp/meta-api');
+    const metaError = {
+      message: '(#131047) Re-engagement message',
+      type: 'OAuthException',
+      code: 131047,
+      error_subcode: 2494010,
+      error_data: {
+        messaging_product: 'whatsapp',
+        details: 'More than 24 hours have passed since the customer last replied.',
+      },
+      fbtrace_id: 'AbC123',
+    };
+    sendTemplateMessage.mockImplementationOnce(async () => {
+      throw new MetaApiError(metaError.message, 131047, {
+        metaError,
+        httpStatus: 400,
+      });
+    });
+
+    logged.length = 0;
+    const captured: CapturedWrites = {};
+    await expect(
+      sendMessageToConversation(sendPathDb([TEMPLATE_ROW], captured), 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'template',
+        templateName: 'order_update',
+        templateParams: ['A123', 'Friday'],
+        actor: { source: 'api', apiKeyId: 'key-1' },
+      })
+    ).rejects.toMatchObject({ code: 'meta_error', status: 502, logged: true });
+
+    // The thread shows the attempt as failed…
+    expect(captured.message).toMatchObject({
+      status: 'failed',
+      message_id: null,
+      template_name: 'order_update',
+    });
+    // …without bumping the conversation preview.
+    expect(captured.conversation).toBeUndefined();
+
+    // Exactly one audit row — the wrapper must not double-log.
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      account_id: 'acct-1',
+      event: 'send',
+      status: 'failed',
+      source: 'api',
+      api_key_id: 'key-1',
+      conversation_id: 'cv-1',
+      recipient: '15551234567',
+      template_name: 'order_update',
+      error_code: '131047',
+      error_subcode: '2494010',
+      error_type: 'OAuthException',
+      error_message: '(#131047) Re-engagement message',
+      error_details:
+        'More than 24 hours have passed since the customer last replied.',
+      fbtrace_id: 'AbC123',
+      http_status: 400,
+      response: { error: metaError },
+    });
+    expect(logged[0].request).toMatchObject({
+      to: '15551234567',
+      type: 'template',
+      template: { name: 'order_update', params: ['A123', 'Friday'] },
+    });
+  });
+
+  it('logs a successful send with the wamid', async () => {
+    logged.length = 0;
+    await sendMessageToConversation(
+      sendPathDb([TEMPLATE_ROW], {}),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'template',
+        templateName: 'order_update',
+        templateParams: ['A123', 'Friday'],
+        actor: { source: 'dashboard', userId: 'u-1' },
+      }
+    );
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      event: 'send',
+      status: 'sent',
+      source: 'dashboard',
+      user_id: 'u-1',
+      message_id: 'msg-1',
+      whatsapp_message_id: 'wamid.1',
+    });
+  });
+
+  it('logs a pre-Meta rejection once', async () => {
+    logged.length = 0;
+    await expect(
+      sendMessageToConversation(sendPathDb([], {}), 'acct-1', {
+        conversationId: '',
+        messageType: 'text',
+        contentText: 'hi',
+      })
+    ).rejects.toMatchObject({ code: 'bad_request' });
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      event: 'rejected',
+      status: 'failed',
+      error_type: 'bad_request',
+      http_status: 400,
+    });
   });
 });

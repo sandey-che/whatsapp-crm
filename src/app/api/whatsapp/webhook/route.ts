@@ -11,6 +11,7 @@ import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
+import { logMessageEvent, type MessageLogStatus } from '@/lib/whatsapp/message-log'
 import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
@@ -86,12 +87,7 @@ interface WhatsAppWebhookEntry {
         wa_id: string
       }>
       messages?: WhatsAppMessage[]
-      statuses?: Array<{
-        id: string
-        status: string
-        timestamp: string
-        recipient_id: string
-      }>
+      statuses?: Array<WhatsAppStatus>
     }
     field: string
   }>
@@ -263,7 +259,7 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
       if (value.statuses) {
         console.log('[webhook] Processing', value.statuses.length, 'status updates')
         for (const status of value.statuses) {
-          await handleStatusUpdate(status)
+          await handleStatusUpdate(status, value.metadata?.phone_number_id)
         }
       }
 
@@ -416,12 +412,87 @@ function isValidStatusTransition(current: string, incoming: string): boolean {
   return ii > ci
 }
 
-async function handleStatusUpdate(status: {
+/**
+ * Write a webhook delivery status to message_logs. The account comes
+ * from the receiving number (phone_number_id → whatsapp_config); the
+ * message/conversation from our stored row when we have one (broadcast
+ * sends have none, but are still logged by wamid).
+ */
+async function logStatusEvent(status: WhatsAppStatus, phoneNumberId?: string) {
+  if (!['sent', 'delivered', 'read', 'failed'].includes(status.status)) return
+  try {
+    if (!phoneNumberId) return
+    const { data: configRows } = await supabaseAdmin()
+      .from('whatsapp_config')
+      .select('account_id')
+      .eq('phone_number_id', phoneNumberId)
+    // 0 or ≥2 configs — the account is ambiguous; don't guess.
+    if (!configRows || configRows.length !== 1) return
+    const accountId = configRows[0].account_id as string
+
+    const { data: msgRows } = await supabaseAdmin()
+      .from('messages')
+      .select('id, conversation_id, content_type, template_name, conversation:conversations!inner(account_id, contact_id)')
+      .eq('message_id', status.id)
+      .eq('conversation.account_id', accountId)
+      .limit(1)
+    const msg = msgRows?.[0] as
+      | {
+          id: string
+          conversation_id: string
+          content_type: string
+          template_name: string | null
+          conversation: { contact_id: string | null } | { contact_id: string | null }[] | null
+        }
+      | undefined
+    const conv = Array.isArray(msg?.conversation) ? msg?.conversation[0] : msg?.conversation
+
+    const e = status.errors?.[0]
+    const failed = status.status === 'failed'
+    await logMessageEvent({
+      account_id: accountId,
+      event: 'status',
+      status: status.status as MessageLogStatus,
+      source: 'webhook',
+      message_id: msg?.id ?? null,
+      whatsapp_message_id: status.id,
+      conversation_id: msg?.conversation_id ?? null,
+      contact_id: conv?.contact_id ?? null,
+      recipient: status.recipient_id ?? null,
+      message_type: msg?.content_type ?? null,
+      template_name: msg?.template_name ?? null,
+      error_code: failed && e?.code !== undefined ? String(e.code) : null,
+      error_title: failed ? (e?.title ?? null) : null,
+      error_message: failed ? (e?.message ?? e?.title ?? null) : null,
+      error_details: failed ? (e?.error_data?.details ?? null) : null,
+      // The full status object, incl. errors[], conversation & pricing.
+      response: status,
+    })
+  } catch (err) {
+    console.error('[webhook] status audit log failed:', err instanceof Error ? err.message : err)
+  }
+}
+
+interface WhatsAppStatus {
   id: string
   status: string
   timestamp: string
   recipient_id: string
-}) {
+  conversation?: unknown
+  pricing?: unknown
+  /** Present on `failed` statuses — why Meta couldn't deliver. */
+  errors?: Array<{
+    code?: number
+    title?: string
+    message?: string
+    error_data?: { details?: string }
+  }>
+}
+
+async function handleStatusUpdate(
+  status: WhatsAppStatus,
+  phoneNumberId?: string
+) {
   // 1) Mirror onto messages (legacy behavior) — Meta's status values
   //    already match the CHECK constraint on messages.status. No
   //    `.select()`: message_id is NOT unique (migration 009 — Meta ids
@@ -431,6 +502,10 @@ async function handleStatusUpdate(status: {
     .from('messages')
     .update({ status: status.status })
     .eq('message_id', status.id)
+
+  // Audit trail (migration 040) — every status, with Meta's complete
+  // error on failures. Best-effort; never blocks the mirrors below.
+  await logStatusEvent(status, phoneNumberId)
 
   if (msgErr) {
     console.error('Error updating message status:', msgErr)

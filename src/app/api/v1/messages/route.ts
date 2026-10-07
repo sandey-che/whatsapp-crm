@@ -37,11 +37,21 @@ import { resolveConversationByPhone } from '@/lib/whatsapp/resolve-conversation'
 import {
   sendMessageToConversation,
   validateSendMessageParams,
+  logRejectedSend,
   SendMessageError,
 } from '@/lib/whatsapp/send-message';
 import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive';
 
 export async function POST(request: Request) {
+  // Set once the key is authenticated, so failures after that point
+  // can be audited against the account (see message_logs).
+  let audit: {
+    accountId: string;
+    keyId: string;
+    to: string;
+    type: string;
+    templateName: string | null;
+  } | null = null;
   try {
     const ctx = await requireApiKey(request, 'messages:send');
 
@@ -67,6 +77,13 @@ export async function POST(request: Request) {
       body.template && typeof body.template === 'object'
         ? (body.template as Record<string, unknown>)
         : null;
+    audit = {
+      accountId: ctx.accountId,
+      keyId: ctx.keyId,
+      to,
+      type,
+      templateName: typeof template?.name === 'string' ? template.name : null,
+    };
     const templateParams = Array.isArray(template?.params)
       ? (template.params as unknown[]).filter(
           (p): p is string => typeof p === 'string'
@@ -124,6 +141,7 @@ export async function POST(request: Request) {
           typeof body.reply_to_message_id === 'string'
             ? body.reply_to_message_id
             : null,
+        actor: { source: 'api', apiKeyId: ctx.keyId },
       }
     );
 
@@ -138,6 +156,20 @@ export async function POST(request: Request) {
       201
     );
   } catch (err) {
+    // The send core logs its own failures; this covers rejections
+    // before it ran (shape validation, phone resolution).
+    if (audit && !(err instanceof SendMessageError && err.logged)) {
+      await logRejectedSend(
+        audit.accountId,
+        {
+          messageType: audit.type,
+          templateName: audit.templateName,
+          actor: { source: 'api', apiKeyId: audit.keyId },
+        },
+        err,
+        audit.to
+      );
+    }
     if (err instanceof SendMessageError) {
       return fail(err.code, err.message, err.status);
     }
