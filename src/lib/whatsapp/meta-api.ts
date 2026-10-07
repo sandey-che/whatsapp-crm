@@ -23,19 +23,78 @@ export interface MetaPhoneInfo {
   quality_rating?: string
 }
 
+/** Meta's Graph API error object, as returned under `error`. */
+export interface MetaErrorBody {
+  message?: string
+  type?: string
+  code?: number
+  error_subcode?: number
+  error_user_title?: string
+  error_user_msg?: string
+  error_data?: { messaging_product?: string; details?: string } | string
+  fbtrace_id?: string
+}
+
 interface MetaErrorResponse {
-  error?: { message?: string; code?: number; type?: string }
+  error?: MetaErrorBody
+}
+
+/**
+ * A Meta Graph API rejection. Keeps the complete error so callers can
+ * audit it (see message_logs, migration 040): Meta's numeric code, the
+ * full `error` object, the raw body when it wasn't JSON, and the HTTP
+ * status.
+ */
+export class MetaApiError extends Error {
+  readonly metaCode: number | null
+  readonly metaError: MetaErrorBody | null
+  readonly httpStatus: number | null
+  readonly rawBody: string | null
+  constructor(
+    message: string,
+    metaCode: number | null,
+    details: {
+      metaError?: MetaErrorBody | null
+      httpStatus?: number | null
+      rawBody?: string | null
+    } = {}
+  ) {
+    super(message)
+    this.name = 'MetaApiError'
+    this.metaCode = metaCode
+    this.metaError = details.metaError ?? null
+    this.httpStatus = details.httpStatus ?? null
+    this.rawBody = details.rawBody ?? null
+  }
 }
 
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
   let message = fallback
+  let code: number | null = null
+  let metaError: MetaErrorBody | null = null
+  let rawBody: string | null = null
   try {
-    const data = (await response.json()) as MetaErrorResponse
+    // Read as text so a non-JSON body (proxy error page, …) is kept too.
+    // Some test doubles only implement json().
+    rawBody =
+      typeof response.text === 'function'
+        ? await response.text()
+        : JSON.stringify(await response.json())
+    const data = JSON.parse(rawBody) as MetaErrorResponse
+    if (data.error) {
+      metaError = data.error
+      rawBody = null // fully represented by metaError
+    }
     if (data.error?.message) message = data.error.message
+    if (typeof data.error?.code === 'number') code = data.error.code
   } catch {
-    // response body wasn't JSON — keep the fallback
+    // response body wasn't JSON — keep the fallback (and the raw text)
   }
-  throw new Error(message)
+  throw new MetaApiError(message, code, {
+    metaError,
+    httpStatus: response.status,
+    rawBody,
+  })
 }
 
 // ============================================================

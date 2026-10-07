@@ -165,6 +165,7 @@ export async function POST(request: Request) {
         templateMessageParams: template_message_params,
         interactivePayload: interactive_payload,
         replyToMessageId: reply_to_message_id,
+        actor: { source: 'dashboard', userId },
       })
 
       return NextResponse.json({
