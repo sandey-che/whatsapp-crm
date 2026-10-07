@@ -3,6 +3,7 @@
 import { use, useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
 import { Loader2 } from "lucide-react"
+import { useTranslations } from "next-intl"
 
 import {
   AutomationBuilder,
@@ -19,6 +20,7 @@ export default function EditAutomationPage({
 }) {
   const { id } = use(params)
   const router = useRouter()
+  const t = useTranslations("Automations.edit")
   const [initial, setInitial] = useState<BuilderInitial | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -27,7 +29,7 @@ export default function EditAutomationPage({
     async function load() {
       const res = await fetch(`/api/automations/${id}`)
       if (!res.ok) {
-        if (!cancelled) setError(`Failed to load (${res.status})`)
+        if (!cancelled) setError(t("loadError", { status: res.status }))
         return
       }
       const body = await res.json()
@@ -54,9 +56,9 @@ export default function EditAutomationPage({
         <p className="text-sm text-red-400">{error}</p>
         <button
           onClick={() => router.push("/automations")}
-          className="text-sm text-violet-400 hover:text-violet-300"
+          className="text-sm text-primary hover:text-primary/80"
         >
-          Back to Automations
+          {t("back")}
         </button>
       </div>
     )
@@ -65,7 +67,7 @@ export default function EditAutomationPage({
   if (!initial) {
     return (
       <div className="flex h-screen items-center justify-center">
-        <Loader2 className="h-6 w-6 animate-spin text-violet-500" />
+        <Loader2 className="h-6 w-6 animate-spin text-primary" />
       </div>
     )
   }

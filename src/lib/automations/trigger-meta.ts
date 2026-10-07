@@ -21,7 +21,7 @@ export const TRIGGER_META: Record<AutomationTriggerType, TriggerMeta> = {
   },
   new_contact_created: {
     label: 'New Contact',
-    pillClass: 'border-violet-500/30 bg-violet-500/10 text-violet-300',
+    pillClass: 'border-primary/30 bg-primary/10 text-primary',
   },
   conversation_assigned: {
     label: 'Conversation Assigned',
@@ -33,7 +33,11 @@ export const TRIGGER_META: Record<AutomationTriggerType, TriggerMeta> = {
   },
   time_based: {
     label: 'Time-Based',
-    pillClass: 'border-slate-500/30 bg-slate-500/10 text-slate-300',
+    pillClass: 'border-slate-500/30 bg-slate-500/10 text-muted-foreground',
+  },
+  interactive_reply: {
+    label: 'Button / List Reply',
+    pillClass: 'border-pink-500/30 bg-pink-500/10 text-pink-300',
   },
 }
 
@@ -41,7 +45,7 @@ export function triggerMeta(t: AutomationTriggerType | string): TriggerMeta {
   return (
     TRIGGER_META[t as AutomationTriggerType] ?? {
       label: t,
-      pillClass: 'border-slate-500/30 bg-slate-500/10 text-slate-300',
+      pillClass: 'border-slate-500/30 bg-slate-500/10 text-muted-foreground',
     }
   )
 }
