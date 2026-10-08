@@ -707,3 +707,38 @@ export interface QuickReply {
   created_at: string;
   updated_at: string;
 }
+
+/**
+ * One audited outbound-message event (migration 040, `message_logs`):
+ * a send attempt, a pre-Meta rejection, or a webhook delivery status.
+ * Failures carry Meta's complete error.
+ */
+export interface MessageLog {
+  id: string;
+  account_id: string;
+  created_at: string;
+  event: 'send' | 'rejected' | 'status';
+  status: 'sent' | 'delivered' | 'read' | 'failed';
+  source: 'dashboard' | 'api' | 'webhook';
+  message_id: string | null;
+  whatsapp_message_id: string | null;
+  conversation_id: string | null;
+  contact_id: string | null;
+  recipient: string | null;
+  message_type: string | null;
+  template_name: string | null;
+  template_language: string | null;
+  user_id: string | null;
+  api_key_id: string | null;
+  error_code: string | null;
+  error_subcode: string | null;
+  error_type: string | null;
+  error_title: string | null;
+  error_message: string | null;
+  error_details: string | null;
+  fbtrace_id: string | null;
+  http_status: number | null;
+  request: unknown;
+  response: unknown;
+  duration_ms: number | null;
+}

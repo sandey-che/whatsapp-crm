@@ -8,10 +8,11 @@ import {
   normalizeConversations,
 } from "@/lib/inbox/conversations";
 import { cn } from "@/lib/utils";
-import type { Conversation, ConversationStatus, Tag } from "@/types";
-import { Search, ChevronDown, X } from "lucide-react";
+import type { Conversation, ConversationStatus, Tag, Contact} from "@/types";
+import { Search, ChevronDown, X, Plus } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { useTranslations } from "next-intl";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   DropdownMenu,
@@ -21,6 +22,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { NewConversationModal } from "./new-conversation-modal";
 
 interface ConversationListProps {
   activeConversationId: string | null;
@@ -72,6 +74,7 @@ export function ConversationList({
   const [tags, setTags] = useState<Tag[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
   const [selectedCompany, setSelectedCompany] = useState<string | null>(null);
+  const [newConversationModalOpen, setNewConversationModalOpen] = useState(false);
 
   // Keep the latest callback in a ref so the fetch effect below can
   // have a stable, empty-dep identity. Previously the fetch useCallback
@@ -210,6 +213,51 @@ export function ConversationList({
     []
   );
 
+  const handleStartConversation = useCallback(
+    async (contact: Contact) => {
+      const supabase = createClient();
+
+      // Get current user
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const user = session?.user;
+
+      if (!user) {
+        console.error("User not authenticated");
+        return;
+      }
+
+      // Check if a conversation already exists with this contact
+      const existingConv = conversations.find((c) => c.contact_id === contact.id);
+      if (existingConv) {
+        onSelect(existingConv);
+        return;
+      }
+
+      // Create a new conversation with this contact
+      const { data: newConv, error } = await supabase
+        .from("conversations")
+        .insert({
+          user_id: user.id,
+          contact_id: contact.id,
+          status: "open",
+        })
+        .select("*, contact:contacts(*)")
+        .single();
+
+      if (error) {
+        console.error("Failed to create conversation:", error);
+        return;
+      }
+
+      if (newConv) {
+        onSelect(newConv as Conversation);
+      }
+    },
+    [conversations, onSelect]
+  );
+
   const handleSelect = useCallback(
     (conv: Conversation) => {
       onSelect(conv);
@@ -223,17 +271,27 @@ export function ConversationList({
     // w-full on mobile so the list occupies the whole viewport when it's
     // the single pane showing; fixed 320px on desktop where it shares the
     // row with the thread + contact sidebar.
-    <div className="flex h-full w-full flex-col border-r border-border bg-card lg:w-80">
-      {/* Search + Filter */}
-      <div className="space-y-2 border-b border-border p-3">
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={search}
-            onChange={handleSearchChange}
-            placeholder={t("searchPlaceholder")}
-            className="border-border bg-muted pl-9 text-sm text-foreground placeholder-muted-foreground focus:border-primary/50"
-          />
+    <div className="flex h-full w-full flex-col border-r border-slate-800 bg-slate-900 lg:w-80">
+      {/* Search + Filter + New Conversation */}
+      <div className="space-y-2 border-b border-slate-800 p-3">
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+            <Input
+              value={search}
+              onChange={handleSearchChange}
+              placeholder="Search conversations..."
+              className="border-slate-700 bg-slate-800 pl-9 text-sm text-white placeholder-slate-500 focus:border-violet-500/50"
+            />
+          </div>
+          <Button
+            onClick={() => setNewConversationModalOpen(true)}
+            size="sm"
+            className="bg-violet-600 hover:bg-violet-700 text-white"
+            title="Start new conversation"
+          >
+            <Plus className="h-4 w-4" />
+          </Button>
         </div>
 
         <div className="flex flex-wrap items-center gap-1">
@@ -419,6 +477,13 @@ export function ConversationList({
           </div>
         )}
       </ScrollArea>
+
+      {/* New Conversation Modal */}
+      <NewConversationModal
+        open={newConversationModalOpen}
+        onOpenChange={setNewConversationModalOpen}
+        onSelectContact={handleStartConversation}
+      />
     </div>
   );
 }

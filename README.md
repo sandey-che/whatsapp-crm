@@ -49,7 +49,8 @@ clone or fork it to run your own CRM.
 - **Account management** — email, password, avatar, global sign-out.
 - **Public REST API** (`/api/v1`) with scoped, revocable API keys —
   build your own automations on top of your CRM. See
-  [docs/public-api.md](./docs/public-api.md).
+  [docs/public-api.md](./docs/public-api.md) (prose) or
+  [docs/openapi.yaml](./docs/openapi.yaml) (OpenAPI 3.1 spec).
 - **MCP server** — drive your CRM from Claude, Cursor, and other AI
   assistants over the [Model Context Protocol](https://modelcontextprotocol.io).
   Read-only by default, opt-in writes. See [docs/mcp.md](./docs/mcp.md)

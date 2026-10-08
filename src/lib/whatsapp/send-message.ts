@@ -47,6 +47,11 @@ import {
   templateBodyParams,
   templateContentText,
 } from '@/lib/whatsapp/template-body';
+import {
+  describeError,
+  logMessageEvent,
+  type MessageLogActor,
+} from '@/lib/whatsapp/message-log';
 
 export const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const;
 export const VALID_MESSAGE_TYPES = [
@@ -64,6 +69,8 @@ export const VALID_MESSAGE_TYPES = [
 export class SendMessageError extends Error {
   readonly code: string;
   readonly status: number;
+  /** True once the failure has been written to message_logs. */
+  logged = false;
   constructor(code: string, message: string, status: number) {
     super(message);
     this.name = 'SendMessageError';
@@ -87,6 +94,8 @@ export interface SendMessageParams {
   /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
+  /** Who triggered the send — recorded on message_logs. */
+  actor?: MessageLogActor;
 }
 
 export interface SendMessageResult {
@@ -188,6 +197,79 @@ export async function sendMessageToConversation(
   accountId: string,
   params: SendMessageParams
 ): Promise<SendMessageResult> {
+  try {
+    return await sendMessageCore(db, accountId, params);
+  } catch (err) {
+    // Anything the core didn't already log (validation, unknown
+    // conversation, WhatsApp not configured, …) never reached Meta.
+    if (!(err instanceof SendMessageError && err.logged)) {
+      await logRejectedSend(accountId, params, err);
+      if (err instanceof SendMessageError) err.logged = true;
+    }
+    throw err;
+  }
+}
+
+/** The parameters we asked Meta to send, for message_logs.request. */
+function requestPayload(params: SendMessageParams, to?: string | null) {
+  return {
+    to: to ?? null,
+    type: params.messageType,
+    text: params.contentText ?? null,
+    media_url: params.mediaUrl ?? null,
+    filename: params.filename ?? null,
+    template: params.templateName
+      ? {
+          name: params.templateName,
+          language: params.templateLanguage ?? null,
+          params: params.templateParams ?? null,
+          message_params: params.templateMessageParams ?? null,
+        }
+      : null,
+    interactive: params.interactivePayload ?? null,
+    reply_to_message_id: params.replyToMessageId ?? null,
+  };
+}
+
+/**
+ * Log a send that was refused before reaching Meta. Exported for
+ * callers that reject a request before calling the core (the public
+ * API's up-front validation + phone resolution).
+ */
+export async function logRejectedSend(
+  accountId: string,
+  params: Partial<SendMessageParams> & { messageType?: string },
+  err: unknown,
+  recipient?: string | null
+): Promise<void> {
+  const detail = describeError(err);
+  await logMessageEvent({
+    account_id: accountId,
+    event: 'rejected',
+    status: 'failed',
+    source: params.actor?.source ?? 'dashboard',
+    user_id: params.actor?.userId ?? null,
+    api_key_id: params.actor?.apiKeyId ?? null,
+    conversation_id: params.conversationId || null,
+    recipient: recipient ?? null,
+    message_type: params.messageType ?? null,
+    template_name: params.templateName ?? null,
+    template_language: params.templateLanguage ?? null,
+    request: requestPayload(params as SendMessageParams, recipient),
+    ...detail,
+    // A SendMessageError's machine code is more useful than its class name.
+    error_type:
+      err instanceof SendMessageError ? err.code : detail.error_type,
+    http_status:
+      err instanceof SendMessageError ? err.status : detail.http_status,
+  });
+}
+
+async function sendMessageCore(
+  db: SupabaseClient,
+  accountId: string,
+  params: SendMessageParams
+): Promise<SendMessageResult> {
   const {
     conversationId,
     messageType,
@@ -200,6 +282,7 @@ export async function sendMessageToConversation(
     templateMessageParams,
     interactivePayload,
     replyToMessageId,
+    actor,
   } = params;
 
   if (!conversationId) {
@@ -405,11 +488,58 @@ export async function sendMessageToConversation(
     return result.messageId;
   };
 
+  // Persisted shape of this message. Field names MUST match the
+  // messages schema (see 001_initial_schema.sql). Built before the send
+  // so a Meta rejection can be recorded with the same shape.
+  // Interactive messages persist the body as content_text (so the
+  // conversation-list preview reads sensibly) plus the full structured
+  // payload so the thread can re-render the buttons / rows.
+  //
+  // Templates persist the *substituted* body. The composer pre-renders
+  // and posts it as contentText; every other caller (the public API,
+  // most importantly) sends none, and storing null there left the
+  // Inbox rendering an empty bubble — issue #483.
+  const persistedText =
+    messageType === 'interactive'
+      ? interactivePayload!.body
+      : messageType === 'template'
+        ? templateContentText(
+            templateRow,
+            templateBodyParams(templateParams, templateMessageParams),
+            contentText
+          )
+        : (contentText ?? null);
+
+  const messageRow = {
+    conversation_id: conversationId,
+    sender_type: 'agent',
+    content_type: messageType,
+    content_text: persistedText,
+    media_url: mediaUrl || null,
+    template_name: templateName || null,
+    interactive_payload:
+      messageType === 'interactive' ? interactivePayload : null,
+    reply_to_message_id: replyToMessageId || null,
+  };
+
   // Send via Meta — retry across phone-number variants if Meta rejects
   // with "recipient not in allowed list"; persist a working variant
   // back to the contact so the next send goes straight through.
   let waMessageId = '';
-  let workingPhone = sendTarget;
+  let workingPhone = sanitizedPhone;
+  const startedAt = Date.now();
+  const logBase = {
+    account_id: accountId,
+    event: 'send' as const,
+    source: actor?.source ?? ('dashboard' as const),
+    user_id: actor?.userId ?? null,
+    api_key_id: actor?.apiKeyId ?? null,
+    conversation_id: conversationId,
+    contact_id: contact.id ?? null,
+    message_type: messageType,
+    template_name: templateName || null,
+    template_language: messageType === 'template' ? sendLanguage : null,
+  };
   try {
     // Variants only make sense for a phone number — a BSUID is opaque
     // and has exactly one correct form, so it gets a single attempt.
@@ -439,7 +569,36 @@ export async function sendMessageToConversation(
     const message =
       err instanceof Error ? err.message : 'Unknown Meta API error';
     console.error('[send-message] Meta send failed for all variants:', message);
-    throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
+    // Record the rejected send as a failed message so it's visible in
+    // the thread. Best-effort — never masks the Meta error.
+    const { data: failedRow, error: failedErr } = await db
+      .from('messages')
+      .insert({ ...messageRow, message_id: null, status: 'failed' })
+      .select('id')
+      .single();
+    if (failedErr) {
+      console.error(
+        '[send-message] failed to record failed message:',
+        failedErr.message
+      );
+    }
+    // Full audit entry with Meta's complete error (migration 040).
+    await logMessageEvent({
+      ...logBase,
+      status: 'failed',
+      message_id: failedRow?.id ?? null,
+      recipient: sanitizedPhone,
+      request: requestPayload(params, sanitizedPhone),
+      duration_ms: Date.now() - startedAt,
+      ...describeError(err),
+    });
+    const sendErr = new SendMessageError(
+      'meta_error',
+      `Meta API error: ${message}`,
+      502
+    );
+    sendErr.logged = true;
+    throw sendErr;
   }
 
   if (hasValidPhone && workingPhone !== sanitizedPhone) {
@@ -452,52 +611,45 @@ export async function sendMessageToConversation(
       .eq('id', contact.id);
   }
 
-  // Persist the sent message. Field names MUST match the messages
-  // schema (see 001_initial_schema.sql).
-  // Interactive messages persist the body as content_text (so the
-  // conversation-list preview reads sensibly) plus the full structured
-  // payload so the thread can re-render the buttons / rows.
-  //
-  // Templates persist the *substituted* body. The composer pre-renders
-  // and posts it as contentText; every other caller (the public API,
-  // most importantly) sends none, and storing null there left the
-  // Inbox rendering an empty bubble — issue #483.
-  const persistedText =
-    messageType === 'interactive'
-      ? interactivePayload!.body
-      : messageType === 'template'
-        ? templateContentText(
-            templateRow,
-            templateBodyParams(templateParams, templateMessageParams),
-            contentText
-          )
-        : (contentText ?? null);
-
   const { data: messageRecord, error: msgError } = await db
     .from('messages')
     .insert({
-      conversation_id: conversationId,
-      sender_type: 'agent',
-      content_type: messageType,
-      content_text: persistedText,
-      media_url: mediaUrl || null,
-      template_name: templateName || null,
-      interactive_payload:
-        messageType === 'interactive' ? interactivePayload : null,
+      ...messageRow,
       message_id: waMessageId,
       status: 'sent',
-      reply_to_message_id: replyToMessageId || null,
     })
     .select()
     .single();
 
+  // Audit entry for the accepted send. A DB save failure is noted on it
+  // (Meta did accept the message) rather than logged as a separate
+  // rejection.
+  await logMessageEvent({
+    ...logBase,
+    status: 'sent',
+    message_id: messageRecord?.id ?? null,
+    whatsapp_message_id: waMessageId,
+    recipient: workingPhone,
+    request: requestPayload(params, workingPhone),
+    response: { messages: [{ id: waMessageId }] },
+    duration_ms: Date.now() - startedAt,
+    ...(msgError
+      ? {
+          error_type: 'db_error',
+          error_message: `Sent to Meta but failed to save to DB: ${msgError.message}`,
+        }
+      : {}),
+  });
+
   if (msgError) {
     console.error('[send-message] error inserting sent message:', msgError);
-    throw new SendMessageError(
+    const dbErr = new SendMessageError(
       'db_error',
       `Message sent to Meta but failed to save to DB: ${msgError.message}`,
       500
     );
+    dbErr.logged = true;
+    throw dbErr;
   }
 
   const lastMessageText =

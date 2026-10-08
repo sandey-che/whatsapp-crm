@@ -18,6 +18,7 @@ import { resumeAwaitingReply, runAutomationsForTrigger } from '@/lib/automations
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
+import { logMessageEvent, type MessageLogStatus } from '@/lib/whatsapp/message-log'
 import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
@@ -116,19 +117,7 @@ interface WhatsAppWebhookEntry {
         parent_user_id?: string
       }>
       messages?: WhatsAppMessage[]
-      statuses?: Array<{
-        id: string
-        status: string
-        timestamp: string
-        recipient_id: string
-        /**
-         * Only present when `status === 'failed'`. Meta's reason for the
-         * failure — `code` is a stable numeric error code (e.g. 131049),
-         * `title` a short label, `error_data.details` the human-readable
-         * explanation. See #535.
-         */
-        errors?: MetaStatusError[]
-      }>
+      statuses?: Array<WhatsAppStatus>
     }
     field: string
   }>
@@ -218,11 +207,15 @@ export async function GET(request: Request) {
 
 // POST - Receive messages
 export async function POST(request: Request) {
+  console.log('[webhook] POST request received at', new Date().toISOString())
+  
   // Read raw body first so we can HMAC-verify the exact bytes Meta
   // signed. request.json() would re-encode and break the signature.
   const rawBody = await request.text()
   const signature = request.headers.get('x-hub-signature-256')
 
+  console.log('[webhook] Signature present:', !!signature)
+  
   if (!verifyMetaWebhookSignature(rawBody, signature)) {
     // 401 (not 200) — we want Meta's delivery dashboard to show failures
     // loudly if a misconfiguration causes signatures to stop matching,
@@ -231,10 +224,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
   }
 
+  console.log('[webhook] Signature verified ✓')
+
   let body: { entry?: WhatsAppWebhookEntry[] }
   try {
     body = JSON.parse(rawBody)
-  } catch {
+  } catch (err) {
+    console.error('[webhook] Failed to parse JSON:', err)
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
   }
 
@@ -264,9 +260,15 @@ export async function POST(request: Request) {
 }
 
 async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
-  if (!body.entry) return
+  if (!body.entry) {
+    console.log('[webhook] No entries in body')
+    return
+  }
+
+  console.log('[webhook] Processing', body.entry.length, 'entries')
 
   for (const entry of body.entry) {
+    console.log('[webhook] Processing entry:', entry.id)
     for (const change of entry.changes) {
       // Template-lifecycle events (status / quality / components
       // updates from Meta) come in on a different change.field and
@@ -292,15 +294,27 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       // Handle status updates
       if (value.statuses) {
+        console.log('[webhook] Processing', value.statuses.length, 'status updates')
         for (const status of value.statuses) {
-          await handleStatusUpdate(status)
+          await handleStatusUpdate(status, value.metadata?.phone_number_id)
         }
       }
 
       // Handle incoming messages
-      if (!value.messages || !value.contacts) continue
+      if (!value.messages || value.messages.length === 0) {
+        console.log('[webhook] No messages in this change')
+        continue
+      }
+
+      if (!value.contacts || value.contacts.length === 0) {
+        console.log('[webhook] Warning: messages present but no contacts data. Skipping message processing.')
+        continue
+      }
+
+      console.log('[webhook] Incoming messages:', value.messages.length)
 
       const phoneNumberId = value.metadata.phone_number_id
+      console.log('[webhook] Phone number ID:', phoneNumberId)
 
       // Find user's config by phone_number_id. `.single()` returns
       // PGRST116 for both 0 rows AND ≥2 rows — distinguish them so
@@ -343,7 +357,34 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       for (let i = 0; i < value.messages.length; i++) {
         const message = value.messages[i]
-        const contact = value.contacts[i] || value.contacts[0]
+        
+        // Handle missing contacts array — create a synthetic contact from message data
+        let contact = value.contacts?.[i] || value.contacts?.[0]
+        
+        if (!contact) {
+          // Contacts array is missing or empty — look up contact by phone number from message.from
+          console.log('[webhook] No contacts in payload, looking up contact by phone:', message.from)
+          
+          const { data: foundContact, error: contactErr } = await supabaseAdmin()
+            .from('contacts')
+            .select('id, phone, name, email')
+            .eq('phone', message.from)
+            .eq('user_id', config.user_id)
+            .maybeSingle()
+          
+          if (contactErr || !foundContact) {
+            console.warn('[webhook] Contact not found for phone:', message.from, contactErr)
+            // Create a temporary contact object so message processing doesn't fail
+            contact = {
+              wa_id: message.from,
+              profile: { name: `Contact ${message.from}` }
+            }
+          } else {
+            contact = foundContact
+          }
+        }
+
+        console.log('[webhook] Processing message:', message.id, 'from:', message.from, 'type:', message.type)
 
         await processMessage(
           message,
@@ -408,32 +449,87 @@ function isValidStatusTransition(current: string, incoming: string): boolean {
   return ii > ci
 }
 
-async function handleStatusUpdate(status: {
+/**
+ * Write a webhook delivery status to message_logs. The account comes
+ * from the receiving number (phone_number_id → whatsapp_config); the
+ * message/conversation from our stored row when we have one (broadcast
+ * sends have none, but are still logged by wamid).
+ */
+async function logStatusEvent(status: WhatsAppStatus, phoneNumberId?: string) {
+  if (!['sent', 'delivered', 'read', 'failed'].includes(status.status)) return
+  try {
+    if (!phoneNumberId) return
+    const { data: configRows } = await supabaseAdmin()
+      .from('whatsapp_config')
+      .select('account_id')
+      .eq('phone_number_id', phoneNumberId)
+    // 0 or ≥2 configs — the account is ambiguous; don't guess.
+    if (!configRows || configRows.length !== 1) return
+    const accountId = configRows[0].account_id as string
+
+    const { data: msgRows } = await supabaseAdmin()
+      .from('messages')
+      .select('id, conversation_id, content_type, template_name, conversation:conversations!inner(account_id, contact_id)')
+      .eq('message_id', status.id)
+      .eq('conversation.account_id', accountId)
+      .limit(1)
+    const msg = msgRows?.[0] as
+      | {
+          id: string
+          conversation_id: string
+          content_type: string
+          template_name: string | null
+          conversation: { contact_id: string | null } | { contact_id: string | null }[] | null
+        }
+      | undefined
+    const conv = Array.isArray(msg?.conversation) ? msg?.conversation[0] : msg?.conversation
+
+    const e = status.errors?.[0]
+    const failed = status.status === 'failed'
+    await logMessageEvent({
+      account_id: accountId,
+      event: 'status',
+      status: status.status as MessageLogStatus,
+      source: 'webhook',
+      message_id: msg?.id ?? null,
+      whatsapp_message_id: status.id,
+      conversation_id: msg?.conversation_id ?? null,
+      contact_id: conv?.contact_id ?? null,
+      recipient: status.recipient_id ?? null,
+      message_type: msg?.content_type ?? null,
+      template_name: msg?.template_name ?? null,
+      error_code: failed && e?.code !== undefined ? String(e.code) : null,
+      error_title: failed ? (e?.title ?? null) : null,
+      error_message: failed ? (e?.message ?? e?.title ?? null) : null,
+      error_details: failed ? (e?.error_data?.details ?? null) : null,
+      // The full status object, incl. errors[], conversation & pricing.
+      response: status,
+    })
+  } catch (err) {
+    console.error('[webhook] status audit log failed:', err instanceof Error ? err.message : err)
+  }
+}
+
+interface WhatsAppStatus {
   id: string
   status: string
   timestamp: string
   recipient_id: string
-  errors?: MetaStatusError[]
-}) {
-  // Meta's reason for a failed send (#535). Only read on `failed`; a
-  // later non-failed status for the same wamid leaves the error
-  // columns alone rather than clearing them, so the reason survives.
-  const failure =
-    status.status === 'failed' && status.errors?.[0]
-      ? {
-          code: status.errors[0].code,
-          title: status.errors[0].title,
-          details: status.errors[0].error_data?.details ?? null,
-        }
-      : null
+  conversation?: unknown
+  pricing?: unknown
+  /** Present on `failed` statuses — why Meta couldn't deliver. */
+  errors?: Array<{
+    code?: number
+    title?: string
+    message?: string
+    error_data?: { details?: string }
+  }>
+}
 
-  if (failure) {
-    console.warn(
-      `WhatsApp message ${status.id} failed: [${failure.code}] ${failure.title}` +
-        (failure.details ? ` — ${failure.details}` : '')
-    )
-  }
-
+async function handleStatusUpdate(
+  status: WhatsAppStatus,
+  phoneNumberId?: string
+) {
   // 1) Mirror onto messages (legacy behavior) — Meta's status values
   //    already match the CHECK constraint on messages.status. No
   //    `.select()`: message_id is NOT unique (migration 009 — Meta ids
@@ -449,6 +545,10 @@ async function handleStatusUpdate(status: {
     .from('messages')
     .update(messageUpdate)
     .eq('message_id', status.id)
+
+  // Audit trail (migration 040) — every status, with Meta's complete
+  // error on failures. Best-effort; never blocks the mirrors below.
+  await logStatusEvent(status, phoneNumberId)
 
   if (msgErr) {
     console.error('Error updating message status:', msgErr)

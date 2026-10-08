@@ -1,0 +1,1080 @@
+# ============================================================
+# OpenAPI specification for the wacrm Public API (`/api/v1`).
+#
+# Hand-maintained to match the route handlers under
+# `src/app/api/v1/` and the helpers in `src/lib/api/v1/`,
+# `src/lib/api-keys/`, and `src/lib/webhooks/`. The prose companion
+# is `docs/public-api.md`; keep the two in sync.
+#
+# Validate:  npx @redocly/cli lint docs/openapi.yaml
+# Preview:   npx @redocly/cli preview-docs docs/openapi.yaml
+# ============================================================
+openapi: 3.1.0
+
+info:
+  title: wacrm Public API
+  version: "1.0.0"
+  description: |
+    Drive your wacrm instance from your own scripts and automations —
+    send WhatsApp messages, manage contacts, read conversations, launch
+    broadcasts, and register outbound event webhooks — without going
+    through the dashboard UI.
+
+    ## Authentication
+
+    Every request authenticates with an **account-scoped API key**, sent
+    as a bearer token:
+
+    ```
+    Authorization: Bearer wacrm_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    ```
+
+    Create keys in the dashboard under **Settings → API keys** (admins
+    and owners only). The full key is shown exactly once. A key acts on
+    exactly one account — there is no cross-account access.
+
+    ## Scopes
+
+    A key can only do what its scopes allow. `GET /api/v1/me` works with
+    a scopeless key; every other endpoint requires one specific scope
+    (listed per operation).
+
+    | Scope                | Allows                                |
+    | -------------------- | ------------------------------------- |
+    | `messages:send`      | Send WhatsApp messages                |
+    | `messages:read`      | Read messages and delivery status     |
+    | `contacts:read`      | List and read contacts                |
+    | `contacts:write`     | Create and update contacts            |
+    | `conversations:read` | List and read conversations           |
+    | `broadcasts:send`    | Launch and read broadcast campaigns   |
+    | `webhooks:manage`    | Register and manage outbound webhooks |
+
+    ## Response envelope
+
+    Success: `{ "data": <payload> }` (list endpoints add
+    `"meta": { "next_cursor": <string|null> }`).
+    Failure: `{ "error": { "code": <stable-string>, "message": <human> } }`.
+    Branch on `error.code`; `error.message` may be reworded.
+
+    ## Rate limits
+
+    **120 requests per minute per key.** On `429` the response carries
+    `Retry-After` and `X-RateLimit-Limit` / `-Remaining` / `-Reset`.
+    The limiter is in-memory per process — see `docs/public-api.md` for
+    the multi-instance caveat.
+
+    ## Pagination
+
+    List endpoints are keyset-paginated. Request a page size with
+    `?limit=` (default 50, max 100) and follow `meta.next_cursor` as
+    `?cursor=`. `next_cursor: null` is the last page. Pass the cursor
+    back verbatim — it is opaque.
+
+servers:
+  - url: https://your-crm.example.com/api/v1
+    description: Replace the host with your wacrm deployment.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Identity
+    description: Verify a key and discover its scopes.
+  - name: Messages
+    description: Send WhatsApp messages and read message history.
+  - name: Contacts
+    description: Create, read, and update contacts and their tags.
+  - name: Conversations
+    description: List and read conversations.
+  - name: Broadcasts
+    description: Launch template broadcasts and poll their progress.
+  - name: Webhooks
+    description: Register and manage outbound event webhooks.
+
+paths:
+  /me:
+    get:
+      tags: [Identity]
+      operationId: getMe
+      summary: Identity probe
+      description: |
+        Returns the account the key is bound to and the scopes it
+        carries. Requires only a valid key (no scope). Use it to verify
+        a key works and to discover its scopes.
+      responses:
+        "200":
+          description: Key is valid.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Identity"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /messages:
+    post:
+      tags: [Messages]
+      operationId: sendMessage
+      summary: Send a WhatsApp message
+      description: |
+        Send to an **E.164 phone number** (not an internal id). The
+        endpoint finds-or-creates the contact and conversation, then
+        sends via the same core the dashboard uses.
+
+        Scope: `messages:send`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMessageRequest"
+            examples:
+              text:
+                value: { to: "+14155550123", type: text, text: "Hi 👋" }
+              template:
+                value:
+                  to: "+14155550123"
+                  type: template
+                  template: { name: order_update, language: en_US, params: ["A123"] }
+              image:
+                value:
+                  to: "+14155550123"
+                  type: image
+                  media_url: "https://example.com/promo.jpg"
+                  text: "This week only"
+      responses:
+        "201":
+          description: Accepted by Meta.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/SendMessageResult" }
+        "400":
+          description: |
+            Malformed input, or a domain error. `error.code` is one of
+            `bad_request`, `whatsapp_not_configured`, `template_malformed`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502":
+          description: The request reached Meta and Meta rejected the send (`error.code` = `meta_error`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /contacts:
+    get:
+      tags: [Contacts]
+      operationId: listContacts
+      summary: List contacts
+      description: "Newest first. Scope: `contacts:read`."
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: search
+          in: query
+          description: Matches contact name or phone (substring, case-insensitive).
+          schema: { type: string }
+        - name: tag
+          in: query
+          description: Filter to contacts carrying this tag id.
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: A page of contacts.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Contact" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+    post:
+      tags: [Contacts]
+      operationId: createContact
+      summary: Create a contact (find-or-create by phone)
+      description: |
+        `phone` (E.164) is required. An existing phone match returns
+        `200` with the existing contact; a new contact returns `201`.
+
+        Scope: `contacts:write`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateContactRequest" }
+      responses:
+        "200":
+          description: Existing contact matched by phone.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Contact" }
+        "201":
+          description: New contact created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Contact" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /contacts/{id}:
+    parameters:
+      - $ref: "#/components/parameters/PathId"
+    get:
+      tags: [Contacts]
+      operationId: getContact
+      summary: Read a contact
+      description: "Scope: `contacts:read`. A contact in another account returns `404`."
+      responses:
+        "200":
+          description: The contact.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Contact" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    patch:
+      tags: [Contacts]
+      operationId: updateContact
+      summary: Update a contact
+      description: |
+        Updates only the fields present in the body. `name` / `email` /
+        `company` accept a string or `null` (clears). Pass `tags` (an
+        array of tag names, created if missing) to replace the contact's
+        tag set.
+
+        Scope: `contacts:write`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateContactRequest" }
+      responses:
+        "200":
+          description: The updated contact.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Contact" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /conversations:
+    get:
+      tags: [Conversations]
+      operationId: listConversations
+      summary: List conversations
+      description: "Newest first. Scope: `conversations:read`."
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: status
+          in: query
+          schema: { type: string, enum: [open, pending, closed] }
+        - name: contact_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: A page of conversations.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Conversation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /conversations/{id}:
+    parameters:
+      - $ref: "#/components/parameters/PathId"
+    get:
+      tags: [Conversations]
+      operationId: getConversation
+      summary: Read a conversation
+      description: "Scope: `conversations:read`. A foreign id returns `404`."
+      responses:
+        "200":
+          description: The conversation.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Conversation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /conversations/{id}/messages:
+    parameters:
+      - $ref: "#/components/parameters/PathId"
+    get:
+      tags: [Conversations, Messages]
+      operationId: listConversationMessages
+      summary: List a conversation's messages
+      description: |
+        Newest first. The conversation is verified to belong to your
+        account first (`404` otherwise).
+
+        Scope: `messages:read`.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of messages.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Message" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /broadcasts:
+    post:
+      tags: [Broadcasts]
+      operationId: createBroadcast
+      summary: Launch a template broadcast
+      description: |
+        Persists the broadcast and its recipient rows synchronously,
+        then fans out the sends in the background. Poll
+        `GET /api/v1/broadcasts/{id}` for progress.
+
+        Recipients are capped at **1000 per request**. Invalid phone
+        numbers are dropped and counted as `rejected`.
+
+        Scope: `broadcasts:send`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateBroadcastRequest" }
+            examples:
+              basic:
+                value:
+                  name: "July promo"
+                  template_name: promo_july
+                  template_language: en_US
+                  recipients:
+                    - { to: "+14155550123", params: ["Jane"] }
+                    - { to: "+14155550124" }
+      responses:
+        "202":
+          description: Broadcast persisted; delivery running in the background.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/BroadcastAccepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /broadcasts/{id}:
+    parameters:
+      - $ref: "#/components/parameters/PathId"
+    get:
+      tags: [Broadcasts]
+      operationId: getBroadcast
+      summary: Broadcast status and counts
+      description: |
+        `status` moves `sending` → `sent`; the delivered / read / replied
+        counts keep climbing as Meta delivery webhooks arrive. A foreign
+        id returns `404`.
+
+        Scope: `broadcasts:send`.
+      responses:
+        "200":
+          description: The broadcast.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Broadcast" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /webhooks:
+    get:
+      tags: [Webhooks]
+      operationId: listWebhooks
+      summary: List webhook endpoints
+      description: "Never returns the signing secret. Scope: `webhooks:manage`."
+      responses:
+        "200":
+          description: All endpoints for the account (`meta.next_cursor` is always `null`).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/WebhookEndpoint" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+    post:
+      tags: [Webhooks]
+      operationId: createWebhook
+      summary: Register a webhook endpoint
+      description: |
+        `url` must be `https://`. **The response includes `secret`
+        exactly once** — store it to verify the `X-Wacrm-Signature`
+        header on deliveries. wacrm keeps only an encrypted copy.
+
+        Scope: `webhooks:manage`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateWebhookRequest" }
+            examples:
+              basic:
+                value:
+                  url: "https://example.com/hooks/wacrm"
+                  events: ["message.received", "message.status_updated"]
+      responses:
+        "201":
+          description: Endpoint registered. `data.secret` is present here only.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    allOf:
+                      - $ref: "#/components/schemas/WebhookEndpoint"
+                      - type: object
+                        required: [secret]
+                        properties:
+                          secret:
+                            type: string
+                            description: Signing secret, `whsec_` prefix. Shown once.
+                            example: whsec_abc123...
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /webhooks/{id}:
+    parameters:
+      - $ref: "#/components/parameters/PathId"
+    get:
+      tags: [Webhooks]
+      operationId: getWebhook
+      summary: Read a webhook endpoint
+      description: "Scope: `webhooks:manage`. A foreign id returns `404`."
+      responses:
+        "200":
+          description: The endpoint.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/WebhookEndpoint" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    patch:
+      tags: [Webhooks]
+      operationId: updateWebhook
+      summary: Update a webhook endpoint
+      description: |
+        Send any of `url`, `events`, `is_active`. Setting `is_active:
+        true` also resets the failure counter.
+
+        Scope: `webhooks:manage`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateWebhookRequest" }
+      responses:
+        "200":
+          description: The updated endpoint.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/WebhookEndpoint" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      tags: [Webhooks]
+      operationId: deleteWebhook
+      summary: Delete a webhook endpoint
+      description: "Scope: `webhooks:manage`."
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      deleted: { type: boolean, const: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+webhooks:
+  event-delivery:
+    post:
+      operationId: receiveEventDelivery
+      summary: Outbound event delivery
+      description: |
+        wacrm POSTs to every registered, active endpoint subscribed to
+        the event. Delivery is **best-effort**: one attempt, short
+        timeout, redirects not followed. Dedupe on `id`; do not assume
+        ordering.
+
+        Headers: `X-Wacrm-Event`, `X-Wacrm-Webhook-Id`,
+        `X-Wacrm-Signature: t=<unix_seconds>,v1=<hex>` where
+        `v1 = HMAC-SHA256(secret, "${t}.${rawBody}")`.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookDelivery" }
+      responses:
+        "2XX":
+          description: Any 2xx marks the delivery successful.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "An account-scoped API key: `wacrm_live_…`."
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      description: Page size. Clamped to [1, 100].
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous response's `meta.next_cursor`.
+      schema: { type: string }
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Malformed input (`error.code` = `bad_request`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: Missing, malformed, unknown, revoked, or expired key (`error.code` = `unauthorized`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Forbidden:
+      description: Valid key, but it lacks the scope this endpoint requires (`error.code` = `forbidden`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: No such resource in this account (`error.code` = `not_found`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    RateLimited:
+      description: Per-key rate limit exceeded (`error.code` = `rate_limited`).
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds until the window resets.
+        X-RateLimit-Limit:
+          schema: { type: integer }
+        X-RateLimit-Remaining:
+          schema: { type: integer }
+        X-RateLimit-Reset:
+          schema: { type: integer }
+          description: Unix seconds at which the window resets.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Internal:
+      description: Server error (`error.code` = `internal`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: |
+                Stable, machine-matchable. Core:
+                `unauthorized`, `forbidden`, `rate_limited`,
+                `bad_request`, `not_found`, `internal`. Send-specific:
+                `whatsapp_not_configured`, `meta_error`,
+                `template_malformed`.
+            message:
+              type: string
+              description: Human-facing; may be reworded between releases.
+
+    ListEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: {}
+        meta:
+          type: object
+          required: [next_cursor]
+          properties:
+            next_cursor:
+              type: [string, "null"]
+              description: Pass back as `?cursor=`. `null` on the last page.
+
+    Identity:
+      type: object
+      properties:
+        account:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: [string, "null"] }
+        key:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            scopes:
+              type: array
+              items: { $ref: "#/components/schemas/Scope" }
+
+    Scope:
+      type: string
+      enum:
+        - messages:send
+        - messages:read
+        - contacts:read
+        - contacts:write
+        - conversations:read
+        - broadcasts:send
+        - webhooks:manage
+
+    Tag:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        color: { type: string, example: "#3b82f6" }
+
+    Contact:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string, example: "+14155550123" }
+        name: { type: [string, "null"] }
+        email: { type: [string, "null"] }
+        company: { type: [string, "null"] }
+        avatar_url: { type: [string, "null"] }
+        tags:
+          type: array
+          items: { $ref: "#/components/schemas/Tag" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Conversation:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        contact_id: { type: string, format: uuid }
+        status: { type: string, enum: [open, pending, closed] }
+        assigned_agent_id: { type: [string, "null"], format: uuid }
+        last_message_text: { type: [string, "null"] }
+        last_message_at: { type: [string, "null"], format: date-time }
+        unread_count: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        contact:
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                id: { type: string, format: uuid }
+                phone: { type: string }
+                name: { type: [string, "null"] }
+                email: { type: [string, "null"] }
+                company: { type: [string, "null"] }
+                tags:
+                  type: array
+                  items: { $ref: "#/components/schemas/Tag" }
+
+    Message:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        conversation_id: { type: string, format: uuid }
+        direction: { type: string, enum: [inbound, outbound] }
+        sender_type:
+          type: string
+          description: "`customer` (inbound), or `agent` / `bot` / `system` (outbound)."
+        content_type:
+          type: string
+          example: text
+          description: e.g. `text`, `image`, `video`, `document`, `audio`, `template`, `interactive`.
+        content_text: { type: [string, "null"] }
+        media_url: { type: [string, "null"] }
+        template_name: { type: [string, "null"] }
+        whatsapp_message_id:
+          type: [string, "null"]
+          description: Meta's `wamid.…`.
+        status:
+          type: string
+          description: Delivery state, e.g. `sent`, `delivered`, `read`, `failed`, `received`.
+        reply_to_message_id: { type: [string, "null"], format: uuid }
+        interactive_reply_id:
+          type: [string, "null"]
+          description: For an inbound interactive reply, the button/row `id` the contact chose.
+        created_at: { type: string, format: date-time }
+
+    SendMessageRequest:
+      type: object
+      required: [to]
+      properties:
+        to:
+          type: string
+          description: Recipient phone in E.164.
+          example: "+14155550123"
+        type:
+          type: string
+          enum: [text, template, image, video, document, audio, interactive]
+          default: text
+        text:
+          type: string
+          description: Text body, or the caption for a media send.
+        media_url:
+          type: string
+          format: uri
+          description: Required for `image` / `video` / `document` / `audio`.
+        filename:
+          type: string
+          description: Optional display filename for a `document`.
+        template:
+          type: object
+          description: Required when `type` is `template`.
+          required: [name]
+          properties:
+            name: { type: string }
+            language: { type: string, default: en_US, example: en_US }
+            params:
+              description: |
+                Array = positional body variables. Object = structured
+                params (`{ "body": [...], "headerText": "...", ... }`).
+              oneOf:
+                - type: array
+                  items: { type: string }
+                - type: object
+        interactive_payload:
+          description: Required when `type` is `interactive`.
+          oneOf:
+            - $ref: "#/components/schemas/InteractiveButtons"
+            - $ref: "#/components/schemas/InteractiveList"
+        reply_to_message_id:
+          type: string
+          format: uuid
+          description: Must belong to the same conversation.
+        name:
+          type: string
+          description: Names a newly-created contact (ignored if the contact already exists).
+
+    InteractiveButtons:
+      type: object
+      required: [kind, body, buttons]
+      properties:
+        kind: { type: string, const: buttons }
+        body: { type: string, description: "≤ 1024 chars." }
+        header: { type: string, description: "Optional, ≤ 60 chars." }
+        footer: { type: string, description: "Optional, ≤ 60 chars." }
+        buttons:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items:
+            type: object
+            required: [id, title]
+            properties:
+              id: { type: string, description: Echoed back in the webhook when tapped. }
+              title: { type: string, description: "≤ 20 chars." }
+
+    InteractiveList:
+      type: object
+      required: [kind, body, button_label, sections]
+      properties:
+        kind: { type: string, const: list }
+        body: { type: string }
+        header: { type: string }
+        footer: { type: string }
+        button_label: { type: string, description: "Tap-to-expand label, ≤ 20 chars." }
+        sections:
+          type: array
+          minItems: 1
+          description: "1–10 rows total across all sections."
+          items:
+            type: object
+            required: [rows]
+            properties:
+              title: { type: string }
+              rows:
+                type: array
+                items:
+                  type: object
+                  required: [id, title]
+                  properties:
+                    id: { type: string }
+                    title: { type: string, description: "≤ 24 chars." }
+                    description: { type: string, description: "Optional, ≤ 72 chars." }
+
+    SendMessageResult:
+      type: object
+      properties:
+        message_id: { type: string, format: uuid, description: wacrm's message row id. }
+        whatsapp_message_id: { type: string, description: Meta's `wamid.…`. }
+        conversation_id: { type: string, format: uuid }
+        contact_id: { type: string, format: uuid }
+        contact_created: { type: boolean }
+
+    CreateContactRequest:
+      type: object
+      required: [phone]
+      properties:
+        phone: { type: string, example: "+14155550123" }
+        name: { type: string }
+        email: { type: string }
+        company: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+          description: Tag names; created if missing.
+
+    UpdateContactRequest:
+      type: object
+      description: Send only the fields to change.
+      properties:
+        name: { type: [string, "null"] }
+        email: { type: [string, "null"] }
+        company: { type: [string, "null"] }
+        tags:
+          type: array
+          items: { type: string }
+          description: Replaces the contact's entire tag set. `[]` clears all tags.
+
+    CreateBroadcastRequest:
+      type: object
+      required: [template_name, recipients]
+      properties:
+        name: { type: string, description: Optional label. }
+        template_name: { type: string, description: An approved template. }
+        template_language: { type: string, default: en_US }
+        recipients:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            type: object
+            required: [to]
+            properties:
+              to: { type: string, example: "+14155550123" }
+              params:
+                type: array
+                items: { type: string }
+                description: Positional body variables for this recipient.
+
+    BroadcastAccepted:
+      type: object
+      properties:
+        broadcast_id: { type: string, format: uuid }
+        status: { type: string, const: sending }
+        total_recipients: { type: integer }
+        accepted: { type: integer }
+        rejected: { type: integer, description: Recipients dropped for an invalid phone number. }
+
+    Broadcast:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: [string, "null"] }
+        template_name: { type: string }
+        template_language: { type: [string, "null"] }
+        status: { type: string, enum: [sending, sent, failed] }
+        total_recipients: { type: integer }
+        sent_count: { type: integer }
+        delivered_count: { type: integer }
+        read_count: { type: integer }
+        replied_count: { type: integer }
+        failed_count: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        events:
+          type: array
+          items: { $ref: "#/components/schemas/WebhookEventName" }
+        is_active: { type: boolean }
+        last_delivery_at: { type: [string, "null"], format: date-time }
+        failure_count: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    WebhookEventName:
+      type: string
+      enum:
+        - message.received
+        - message.status_updated
+        - conversation.created
+
+    CreateWebhookRequest:
+      type: object
+      required: [url, events]
+      properties:
+        url: { type: string, format: uri, description: Must be `https://`. }
+        events:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/WebhookEventName" }
+
+    UpdateWebhookRequest:
+      type: object
+      description: Send at least one field.
+      properties:
+        url: { type: string, format: uri }
+        events:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/WebhookEventName" }
+        is_active: { type: boolean }
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique per delivery — dedupe on this.
+        event: { $ref: "#/components/schemas/WebhookEventName" }
+        occurred_at: { type: string, format: date-time }
+        account_id: { type: string, format: uuid }
+        data:
+          description: |
+            Per-event payload — the shape is determined by `event`
+            (`message.received`, `message.status_updated`, or
+            `conversation.created`).
+          anyOf:
+            - title: message.received
+              type: object
+              properties:
+                conversation_id: { type: string, format: uuid }
+                contact_id: { type: string, format: uuid }
+                whatsapp_message_id: { type: string }
+                content_type: { type: string, example: text }
+                text: { type: [string, "null"] }
+            - title: message.status_updated
+              type: object
+              properties:
+                whatsapp_message_id: { type: string }
+                conversation_id: { type: string, format: uuid }
+                status: { type: string, example: delivered }
+            - title: conversation.created
+              type: object
+              properties:
+                conversation_id: { type: string, format: uuid }
+                contact_id: { type: string, format: uuid }
