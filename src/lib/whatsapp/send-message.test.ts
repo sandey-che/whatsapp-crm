@@ -214,11 +214,12 @@ interface CapturedWrites {
  */
 function sendPathDb(
   templateRows: unknown[],
-  captured: CapturedWrites
+  captured: CapturedWrites,
+  contact: Record<string, unknown> = { id: 'ct-1', phone: '+15551234567' }
 ): SupabaseClient {
   const conversation = {
     id: 'cv-1',
-    contact: { id: 'ct-1', phone: '+15551234567' },
+    contact,
   };
   const config = {
     id: 'cfg-1',
