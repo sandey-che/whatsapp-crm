@@ -1,5 +1,5 @@
 -- ============================================================
--- 040 — message_logs: full audit trail of outbound WhatsApp events.
+-- 047 — message_logs: full audit trail of outbound WhatsApp events.
 --
 -- One row per event in an outbound message's life:
 --   * send      — a send attempt to Meta (dashboard composer or the

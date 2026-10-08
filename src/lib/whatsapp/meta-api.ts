@@ -31,46 +31,18 @@ export interface MetaPhoneInfo {
 /** Meta's Graph API error object, as returned under `error`. */
 export interface MetaErrorBody {
   message?: string
-  type?: string
   code?: number
   error_subcode?: number
+  type?: string
+  fbtrace_id?: string
   error_user_title?: string
   error_user_msg?: string
-  error_data?: { messaging_product?: string; details?: string } | string
-  fbtrace_id?: string
+  /** WhatsApp-specific envelope — `details` is the human-readable part. */
+  error_data?: { messaging_product?: string; details?: string }
 }
 
 interface MetaErrorResponse {
   error?: MetaErrorBody
-}
-
-/**
- * A Meta Graph API rejection. Keeps the complete error so callers can
- * audit it (see message_logs, migration 040): Meta's numeric code, the
- * full `error` object, the raw body when it wasn't JSON, and the HTTP
- * status.
- */
-export class MetaApiError extends Error {
-  readonly metaCode: number | null
-  readonly metaError: MetaErrorBody | null
-  readonly httpStatus: number | null
-  readonly rawBody: string | null
-  constructor(
-    message: string,
-    metaCode: number | null,
-    details: {
-      metaError?: MetaErrorBody | null
-      httpStatus?: number | null
-      rawBody?: string | null
-    } = {}
-  ) {
-    super(message)
-    this.name = 'MetaApiError'
-    this.metaCode = metaCode
-    this.metaError = details.metaError ?? null
-    this.httpStatus = details.httpStatus ?? null
-    this.rawBody = details.rawBody ?? null
-  }
 }
 
 /**
@@ -82,6 +54,9 @@ export class MetaApiError extends Error {
  * `meta-error-explain.ts` needs to say *why* a call failed and which
  * setting to check — and what a user has to quote to Meta support
  * (`fbtrace_id`). Issue #505.
+ *
+ * `envelope` / `rawBody` keep the complete response for the
+ * message_logs audit trail (migration 047).
  */
 export class MetaApiError extends Error {
   readonly code: number | null
@@ -91,6 +66,10 @@ export class MetaApiError extends Error {
   readonly httpStatus: number
   /** `error.error_data.details` — WhatsApp endpoints put the useful text here. */
   readonly details: string | null
+  /** The complete `error` object Meta returned, when the body was JSON. */
+  readonly envelope: MetaErrorBody | null
+  /** The raw response body when it wasn't a JSON error envelope. */
+  readonly rawBody: string | null
 
   constructor(
     message: string,
@@ -101,6 +80,8 @@ export class MetaApiError extends Error {
       fbtraceId?: string | null
       httpStatus: number
       details?: string | null
+      envelope?: MetaErrorBody | null
+      rawBody?: string | null
     },
   ) {
     super(message)
@@ -111,6 +92,8 @@ export class MetaApiError extends Error {
     this.fbtraceId = fields.fbtraceId ?? null
     this.httpStatus = fields.httpStatus
     this.details = fields.details ?? null
+    this.envelope = fields.envelope ?? null
+    this.rawBody = fields.rawBody ?? null
   }
 }
 
@@ -120,31 +103,36 @@ export class MetaApiError extends Error {
  */
 async function readMetaError(response: Response, fallback: string): Promise<MetaApiError> {
   let message = fallback
-  let code: number | null = null
-  let metaError: MetaErrorBody | null = null
+  let envelope: MetaErrorBody | undefined
   let rawBody: string | null = null
   try {
-    // Read as text so a non-JSON body (proxy error page, …) is kept too.
-    // Some test doubles only implement json().
+    // Read as text so a non-JSON body (proxy error page, …) is kept for
+    // the audit log too. Some test doubles only implement json().
     rawBody =
       typeof response.text === 'function'
         ? await response.text()
         : JSON.stringify(await response.json())
     const data = JSON.parse(rawBody) as MetaErrorResponse
-    if (data.error) {
-      metaError = data.error
-      rawBody = null // fully represented by metaError
-    }
-    if (data.error?.message) message = data.error.message
-    if (typeof data.error?.code === 'number') code = data.error.code
+    envelope = data.error
+    if (envelope) rawBody = null // fully represented by `envelope`
+    if (envelope?.message) message = envelope.message
   } catch {
     // response body wasn't JSON — keep the fallback (and the raw text)
   }
-  throw new MetaApiError(message, code, {
-    metaError,
+  return new MetaApiError(message, {
+    code: typeof envelope?.code === 'number' ? envelope.code : null,
+    subcode: typeof envelope?.error_subcode === 'number' ? envelope.error_subcode : null,
+    type: envelope?.type ?? null,
+    fbtraceId: envelope?.fbtrace_id ?? null,
     httpStatus: response.status,
+    details: envelope?.error_data?.details ?? null,
+    envelope: envelope ?? null,
     rawBody,
   })
+}
+
+async function throwMetaError(response: Response, fallback: string): Promise<never> {
+  throw await readMetaError(response, fallback)
 }
 
 // ============================================================

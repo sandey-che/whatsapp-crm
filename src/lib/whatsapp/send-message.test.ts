@@ -357,7 +357,7 @@ describe('sendMessageToConversation — template persistence (#483)', () => {
 });
 
 // ============================================================
-// Audit trail — message_logs (migration 040).
+// Audit trail — message_logs (migration 047).
 // ============================================================
 
 describe('sendMessageToConversation — message_logs audit', () => {
@@ -375,9 +375,14 @@ describe('sendMessageToConversation — message_logs audit', () => {
       fbtrace_id: 'AbC123',
     };
     sendTemplateMessage.mockImplementationOnce(async () => {
-      throw new MetaApiError(metaError.message, 131047, {
-        metaError,
+      throw new MetaApiError(metaError.message, {
+        code: metaError.code,
+        subcode: metaError.error_subcode,
+        type: metaError.type,
+        fbtraceId: metaError.fbtrace_id,
         httpStatus: 400,
+        details: metaError.error_data.details,
+        envelope: metaError,
       });
     });
 

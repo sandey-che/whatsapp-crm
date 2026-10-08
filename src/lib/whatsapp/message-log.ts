@@ -1,6 +1,6 @@
 // ============================================================
 // message_logs writer — the audit trail of outbound WhatsApp events
-// (migration 040). Every send attempt, pre-Meta rejection and webhook
+// (migration 047). Every send attempt, pre-Meta rejection and webhook
 // delivery status lands here with the complete error detail, and the
 // dashboard's Logs page reads it back.
 //
@@ -69,18 +69,15 @@ export function describeError(err: unknown): MessageLogErrorFields & {
   response: unknown;
 } {
   if (err instanceof MetaApiError) {
-    const m = err.metaError;
-    const data = m?.error_data;
+    const m = err.envelope;
     return {
-      error_code: str(m?.code ?? err.metaCode),
-      error_subcode: str(m?.error_subcode),
-      error_type: str(m?.type),
+      error_code: str(err.code),
+      error_subcode: str(err.subcode),
+      error_type: str(err.type),
       error_title: str(m?.error_user_title),
       error_message: err.message,
-      error_details:
-        str(typeof data === 'string' ? data : data?.details) ??
-        str(m?.error_user_msg),
-      fbtrace_id: str(m?.fbtrace_id),
+      error_details: str(err.details) ?? str(m?.error_user_msg),
+      fbtrace_id: str(err.fbtraceId),
       http_status: err.httpStatus,
       response: m ? { error: m } : err.rawBody ? { raw: err.rawBody } : null,
     };

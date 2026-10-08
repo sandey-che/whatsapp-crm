@@ -582,7 +582,7 @@ async function sendMessageCore(
         failedErr.message
       );
     }
-    // Full audit entry with Meta's complete error (migration 040).
+    // Full audit entry with Meta's complete error (migration 047).
     await logMessageEvent({
       ...logBase,
       status: 'failed',

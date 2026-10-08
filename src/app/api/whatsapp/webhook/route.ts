@@ -517,19 +517,38 @@ interface WhatsAppStatus {
   recipient_id: string
   conversation?: unknown
   pricing?: unknown
-  /** Present on `failed` statuses — why Meta couldn't deliver. */
-  errors?: Array<{
-    code?: number
-    title?: string
-    message?: string
-    error_data?: { details?: string }
-  }>
+  /**
+   * Only present when `status === 'failed'`. Meta's reason for the
+   * failure — `code` is a stable numeric error code (e.g. 131049),
+   * `title` a short label, `error_data.details` the human-readable
+   * explanation. See #535.
+   */
+  errors?: MetaStatusError[]
 }
 
 async function handleStatusUpdate(
   status: WhatsAppStatus,
   phoneNumberId?: string
 ) {
+  // Meta's reason for a failed send (#535). Only read on `failed`; a
+  // later non-failed status for the same wamid leaves the error
+  // columns alone rather than clearing them, so the reason survives.
+  const failure =
+    status.status === 'failed' && status.errors?.[0]
+      ? {
+          code: status.errors[0].code,
+          title: status.errors[0].title,
+          details: status.errors[0].error_data?.details ?? null,
+        }
+      : null
+
+  if (failure) {
+    console.warn(
+      `WhatsApp message ${status.id} failed: [${failure.code}] ${failure.title}` +
+        (failure.details ? ` — ${failure.details}` : '')
+    )
+  }
+
   // 1) Mirror onto messages (legacy behavior) — Meta's status values
   //    already match the CHECK constraint on messages.status. No
   //    `.select()`: message_id is NOT unique (migration 009 — Meta ids
@@ -546,7 +565,7 @@ async function handleStatusUpdate(
     .update(messageUpdate)
     .eq('message_id', status.id)
 
-  // Audit trail (migration 040) — every status, with Meta's complete
+  // Audit trail (migration 047) — every status, with Meta's complete
   // error on failures. Best-effort; never blocks the mirrors below.
   await logStatusEvent(status, phoneNumberId)
 

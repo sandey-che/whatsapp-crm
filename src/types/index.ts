@@ -709,7 +709,7 @@ export interface QuickReply {
 }
 
 /**
- * One audited outbound-message event (migration 040, `message_logs`):
+ * One audited outbound-message event (migration 047, `message_logs`):
  * a send attempt, a pre-Meta rejection, or a webhook delivery status.
  * Failures carry Meta's complete error.
  */
@@ -741,4 +741,36 @@ export interface MessageLog {
   request: unknown;
   response: unknown;
   duration_ms: number | null;
+}
+
+/**
+ * One outbound message, folded from its `message_logs` events by the
+ * `message_log_threads` view (migration 048). `status` is the furthest
+ * stage reached; the per-stage timestamps drive the progress tracker.
+ */
+export interface MessageLogThread {
+  account_id: string;
+  thread_key: string;
+  whatsapp_message_id: string | null;
+  started_at: string;
+  last_event_at: string;
+  event_count: number;
+  status: MessageLog['status'];
+  origin: 'send' | 'rejected' | 'status';
+  source: MessageLog['source'];
+  recipient: string | null;
+  message_type: string | null;
+  template_name: string | null;
+  template_language: string | null;
+  message_id: string | null;
+  conversation_id: string | null;
+  contact_id: string | null;
+  sent_at: string | null;
+  delivered_at: string | null;
+  read_at: string | null;
+  failed_at: string | null;
+  error_code: string | null;
+  error_title: string | null;
+  error_message: string | null;
+  error_details: string | null;
 }
