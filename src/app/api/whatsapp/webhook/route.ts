@@ -23,6 +23,16 @@ import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
+import {
+  summarizeContacts,
+  summarizeNfmReply,
+  summarizeOrder,
+  type WaNfmReply,
+  type WaOrder,
+  type WaReferral,
+  type WaReferredProduct,
+  type WaSharedContact,
+} from '@/lib/whatsapp/inbound-structured'
 
 // The `after()` callback in POST runs within this route's max duration.
 // Inbound processing can fan out to per-media Meta verification calls, so
@@ -74,9 +84,11 @@ interface WhatsAppMessage {
    * to advance the per-contact run.
    */
   interactive?: {
-    type: 'button_reply' | 'list_reply'
+    /** `nfm_reply` = a submitted WhatsApp Flow form. */
+    type: 'button_reply' | 'list_reply' | 'nfm_reply'
     button_reply?: { id: string; title: string }
     list_reply?: { id: string; title: string; description?: string }
+    nfm_reply?: WaNfmReply
   }
   /**
    * Set when the customer taps a QUICK_REPLY button on a *template*
@@ -87,8 +99,20 @@ interface WhatsAppMessage {
    * payload and mirrors the label into it).
    */
   button?: { text?: string; payload?: string }
-  /** Present when the customer swipe-replies to one of our messages. */
-  context?: { id: string }
+  /** A cart the customer submitted from the catalog (`type: 'order'`). */
+  order?: WaOrder
+  /** Contact cards the customer shared (`type: 'contacts'`). */
+  contacts?: WaSharedContact[]
+  /** Set when the conversation started from a click-to-WhatsApp ad. */
+  referral?: WaReferral
+  /** Meta's reason, on `type: 'unsupported'` messages. */
+  errors?: { code?: number; title?: string; error_data?: { details?: string } }[]
+  /**
+   * Present when the customer swipe-replies to one of our messages, or
+   * taps "Message business" on a catalog product — then
+   * `referred_product` names the product they're asking about.
+   */
+  context?: { id: string; referred_product?: WaReferredProduct }
 }
 
 /** One entry of a failed status's `errors` array, as Meta sends it. */
@@ -837,7 +861,7 @@ async function processMessage(
   }
 
   // Parse message content based on type
-  const { contentText, mediaUrl, mediaType, interactiveReplyId } =
+  const { contentText, mediaUrl, mediaType, interactiveReplyId, inboundPayload } =
     await parseMessageContent(
       message,
       accessToken,
@@ -867,13 +891,15 @@ async function processMessage(
   //   created_at
 
   // The messages.content_type CHECK constraint (widened in migration 010
-  // to add 'interactive' for button/list taps) allows:
-  //   text, image, document, audio, video, location, template, interactive
+  // to add 'interactive' for button/list taps, and 049 for 'order')
+  // allows:
+  //   text, image, document, audio, video, location, template,
+  //   interactive, order
   // Map incoming WhatsApp types that aren't in that list to the closest
   // allowed value so the INSERT doesn't fail with a constraint error.
   const ALLOWED_CONTENT_TYPES = new Set([
     'text', 'image', 'document', 'audio', 'video',
-    'location', 'template', 'interactive',
+    'location', 'template', 'interactive', 'order',
   ])
   const contentType = ALLOWED_CONTENT_TYPES.has(message.type)
     ? message.type
@@ -881,7 +907,7 @@ async function processMessage(
       ? 'image'         // stickers are images
       : message.type === 'button'
         ? 'interactive' // template quick-reply tap (issue #478)
-        : 'text'        // reaction, unknown → text fallback
+        : 'text'        // contacts, unknown → text fallback (raw kept in inbound_payload)
 
   // Determine whether this is the contact's very first inbound message
   // BEFORE we insert, so the count is accurate. Covers the case where
@@ -924,6 +950,9 @@ async function processMessage(
         // the column; null for every other content_type so existing inserts
         // behave identically.
         interactive_reply_id: interactiveReplyId,
+        // Raw Meta message for orders / contacts / Flow responses /
+        // unknown types (migration 049). Null for plain text and media.
+        inbound_payload: inboundPayload,
       },
       { onConflict: 'conversation_id,message_id', ignoreDuplicates: true }
     )
@@ -1125,6 +1154,9 @@ async function processMessage(
     whatsapp_message_id: message.id,
     content_type: contentType,
     text: contentText,
+    // Structured content (e.g. an order's cart) that `text` only
+    // summarises. Null for plain text and media.
+    payload: inboundPayload,
   })
 }
 
@@ -1146,6 +1178,14 @@ async function parseMessageContent(
    * tap with the right affordance. Null for everything else.
    */
   interactiveReplyId: string | null
+  /**
+   * The raw Meta message, for content `contentText` can only summarise:
+   * orders, shared contacts, Flow form responses, product enquiries, ad
+   * referrals and unrecognised types. Persisted to
+   * `messages.inbound_payload` (migration 049) so nothing Meta sent is
+   * lost. Null for plain text and media.
+   */
+  inboundPayload: WhatsAppMessage | null
 }> {
   // getMediaUrl signature is (mediaId, accessToken) — earlier code had
   // the args swapped, so every verification hit an invalid Meta URL and
@@ -1203,11 +1243,36 @@ async function parseMessageContent(
     mediaUrl: null,
     mediaType: null,
     interactiveReplyId: null,
+    inboundPayload: null,
   }
 
   switch (message.type) {
     case 'text':
-      return { ...empty, contentText: message.text?.body || null }
+      return {
+        ...empty,
+        contentText: message.text?.body || null,
+        // Keep the product enquired about / the ad the chat came from;
+        // the body alone loses which product or campaign it was.
+        inboundPayload:
+          message.context?.referred_product || message.referral ? message : null,
+      }
+
+    case 'order':
+      // Cart submitted from the catalog. Meta sends retailer ids,
+      // quantities and prices — summarise them for the preview,
+      // automations and AI, and keep the full cart for the inbox.
+      return {
+        ...empty,
+        contentText: summarizeOrder(message.order),
+        inboundPayload: message,
+      }
+
+    case 'contacts':
+      return {
+        ...empty,
+        contentText: summarizeContacts(message.contacts) || '[Shared contact]',
+        inboundPayload: message,
+      }
 
     case 'image':
       if (message.image?.id) {
@@ -1286,6 +1351,15 @@ async function parseMessageContent(
       return { ...empty, contentText: message.reaction?.emoji || null }
 
     case 'interactive': {
+      // A submitted WhatsApp Flow form carries its answers as JSON in
+      // `nfm_reply.response_json`; there's no button id to route on.
+      if (message.interactive?.type === 'nfm_reply' || message.interactive?.nfm_reply) {
+        return {
+          ...empty,
+          contentText: summarizeNfmReply(message.interactive?.nfm_reply),
+          inboundPayload: message,
+        }
+      }
       // The customer tapped a reply button or a list row on a message
       // we previously sent. Meta delivers `interactive.button_reply` for
       // 3-button messages and `interactive.list_reply` for list messages.
@@ -1326,11 +1400,18 @@ async function parseMessageContent(
       }
     }
 
-    default:
+    default: {
+      // A type we don't parse yet. Keep Meta's payload so the content
+      // can be recovered and rendered later instead of being lost — the
+      // placeholder text alone is what dropped catalog orders before
+      // migration 049. Meta's own `unsupported` type explains why.
+      const reason = message.errors?.[0]?.error_data?.details || message.errors?.[0]?.title
       return {
         ...empty,
-        contentText: `[Unsupported message type: ${message.type}]`,
+        contentText: `[Unsupported message type: ${message.type}]${reason ? ` ${reason}` : ''}`,
+        inboundPayload: message,
       }
+    }
   }
 }
 

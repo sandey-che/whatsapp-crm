@@ -11,6 +11,9 @@ import {
   LayoutTemplate,
   CornerDownLeft,
   Sparkles,
+  ShoppingCart,
+  Package,
+  Megaphone,
 } from "lucide-react";
 import { format } from "date-fns";
 import { ReplyQuote } from "./reply-quote";
@@ -23,6 +26,7 @@ import {
   MediaVideoBubble,
 } from "./message-media";
 import { InteractivePreview } from "@/components/interactive/interactive-preview";
+import { orderTotal } from "@/lib/whatsapp/inbound-structured";
 import { useTranslations } from "next-intl";
 
 interface MessageBubbleProps {
@@ -99,6 +103,96 @@ function StatusIcon({
   }
 }
 
+/** Small label above a bubble's body; inverts on the primary fill. */
+function BubbleBadge({
+  icon: Icon,
+  label,
+  isAgent,
+}: {
+  icon: typeof ShoppingCart;
+  label: string;
+  isAgent: boolean;
+}) {
+  return (
+    <span
+      className={cn(
+        "mb-1 inline-flex max-w-full items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium",
+        isAgent
+          ? "bg-primary-foreground/20 text-primary-foreground"
+          : "bg-primary/20 text-primary",
+      )}
+    >
+      <Icon className="h-3 w-3 shrink-0" />
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
+
+/**
+ * A catalog cart the customer submitted (migration 049). Rendered from
+ * `inbound_payload.order`; rows written before the payload existed — or
+ * a payload missing its items — fall back to the text summary.
+ */
+function OrderContent({
+  message,
+  t,
+  isAgent,
+}: {
+  message: Message;
+  t: ReturnType<typeof useTranslations>;
+  isAgent: boolean;
+}) {
+  const order = message.inbound_payload?.order;
+  const items = order?.product_items ?? [];
+  if (items.length === 0) {
+    return (
+      <div>
+        <BubbleBadge icon={ShoppingCart} label={t("order")} isAgent={isAgent} />
+        <p className="whitespace-pre-wrap break-words text-sm">
+          {message.content_text || t("unsupported")}
+        </p>
+      </div>
+    );
+  }
+
+  const { itemCount, total, currency } = orderTotal(order);
+  return (
+    <div className="min-w-[200px]">
+      <BubbleBadge
+        icon={ShoppingCart}
+        label={`${t("order")} · ${t("orderItems", { count: itemCount })}`}
+        isAgent={isAgent}
+      />
+      <ul className="mt-1 space-y-1 text-sm">
+        {items.map((item, i) => (
+          <li key={`${item.product_retailer_id}-${i}`} className="flex justify-between gap-3">
+            <span className="min-w-0 break-words">
+              <span className="font-medium">{item.quantity ?? 1} ×</span>{" "}
+              {item.product_retailer_id || t("orderUnknownItem")}
+            </span>
+            {item.item_price !== undefined && (
+              <span className="shrink-0 tabular-nums opacity-80">
+                {item.item_price} {item.currency}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+      {total !== null && (
+        <p className="mt-1.5 flex justify-between gap-3 border-t border-current/15 pt-1.5 text-sm font-medium">
+          <span>{t("orderTotal")}</span>
+          <span className="tabular-nums">
+            {total} {currency}
+          </span>
+        </p>
+      )}
+      {order?.text?.trim() && (
+        <p className="mt-1.5 whitespace-pre-wrap break-words text-sm">{order.text}</p>
+      )}
+    </div>
+  );
+}
+
 function MessageContent({
   message,
   t,
@@ -116,12 +210,37 @@ function MessageContent({
   const openMedia = onOpenMedia ? () => onOpenMedia(message.id) : undefined;
 
   switch (message.content_type) {
-    case "text":
+    case "text": {
+      // A product enquiry ("Message business" on a catalog item) or a
+      // chat opened from a click-to-WhatsApp ad: show what it refers to,
+      // which the typed text alone doesn't say. Migration 049.
+      const product = message.inbound_payload?.context?.referred_product;
+      const referral = message.inbound_payload?.referral;
       return (
-        <p className="whitespace-pre-wrap break-words text-sm">
-          {message.content_text}
-        </p>
+        <div>
+          {product?.product_retailer_id && (
+            <BubbleBadge
+              icon={Package}
+              label={t("aboutProduct", { id: product.product_retailer_id })}
+              isAgent={isAgent}
+            />
+          )}
+          {referral && (
+            <BubbleBadge
+              icon={Megaphone}
+              label={referral.headline ? t("fromAdNamed", { headline: referral.headline }) : t("fromAd")}
+              isAgent={isAgent}
+            />
+          )}
+          <p className="whitespace-pre-wrap break-words text-sm">
+            {message.content_text}
+          </p>
+        </div>
       );
+    }
+
+    case "order":
+      return <OrderContent message={message} t={t} isAgent={isAgent} />;
 
     case "image":
       return (

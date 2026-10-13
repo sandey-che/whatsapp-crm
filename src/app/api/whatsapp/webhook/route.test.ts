@@ -517,6 +517,138 @@ describe('inbound webhook: template quick-reply buttons (#478)', () => {
   })
 })
 
+describe('inbound webhook: structured content is kept (migration 049)', () => {
+  const base = { from: '15551230000', timestamp: '1700000000' }
+
+  const ORDER_MESSAGE = {
+    ...base,
+    id: 'wamid.ORDER1',
+    type: 'order',
+    order: {
+      catalog_id: 'CAT1',
+      text: 'Deliver after 6pm',
+      product_items: [
+        { product_retailer_id: 'SKU-1', quantity: 2, item_price: 499, currency: 'INR' },
+        { product_retailer_id: 'SKU-2', quantity: '1', item_price: '99.5', currency: 'INR' },
+      ],
+    },
+  }
+
+  it('stores a catalog order with its cart instead of an unsupported placeholder', async () => {
+    await runWebhook(ORDER_MESSAGE)
+
+    expect(h.state.upsertCalls).toHaveLength(1)
+    const row = h.state.upsertCalls[0].row
+    expect(row).toMatchObject({
+      content_type: 'order',
+      inbound_payload: ORDER_MESSAGE,
+      interactive_reply_id: null,
+    })
+    expect(row.content_text).toBe(
+      [
+        'Order: 3 items, total 1097.5 INR',
+        '- 2 x SKU-1 @ 499 INR',
+        '- 1 x SKU-2 @ 99.5 INR',
+        'Note: Deliver after 6pm',
+      ].join('\n'),
+    )
+    expect(row.content_text).not.toContain('Unsupported')
+  })
+
+  it('sends the cart on the message.received webhook', async () => {
+    await runWebhook(ORDER_MESSAGE)
+
+    expect(h.dispatchWebhookEvent).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      'message.received',
+      expect.objectContaining({ content_type: 'order', payload: ORDER_MESSAGE }),
+    )
+  })
+
+  it('summarises a shared contact card and keeps the card', async () => {
+    const msg = {
+      ...base,
+      id: 'wamid.CONTACT1',
+      type: 'contacts',
+      contacts: [{ name: { formatted_name: 'Jane Doe' }, phones: [{ phone: '+15559876543' }] }],
+    }
+    await runWebhook(msg)
+
+    expect(h.state.upsertCalls[0].row).toMatchObject({
+      content_type: 'text',
+      content_text: 'Contact: Jane Doe (+15559876543)',
+      inbound_payload: msg,
+    })
+  })
+
+  it('keeps the answers of a submitted WhatsApp Flow form', async () => {
+    const msg = {
+      ...base,
+      id: 'wamid.NFM1',
+      type: 'interactive',
+      interactive: {
+        type: 'nfm_reply',
+        nfm_reply: {
+          name: 'flow',
+          body: 'Sent',
+          response_json: JSON.stringify({ flow_token: 'tok', size: 'M', qty: 2 }),
+        },
+      },
+    }
+    await runWebhook(msg)
+
+    expect(h.state.upsertCalls[0].row).toMatchObject({
+      content_type: 'interactive',
+      content_text: 'Form response: size: M, qty: 2',
+      interactive_reply_id: null,
+      inbound_payload: msg,
+    })
+  })
+
+  it('keeps the product a customer enquired about from the catalog', async () => {
+    const msg = {
+      ...base,
+      id: 'wamid.ENQ1',
+      type: 'text',
+      text: { body: 'Is this in stock?' },
+      context: {
+        id: 'wamid.PRODUCT1',
+        referred_product: { catalog_id: 'CAT1', product_retailer_id: 'SKU-1' },
+      },
+    }
+    await runWebhook(msg)
+
+    expect(h.state.upsertCalls[0].row).toMatchObject({
+      content_type: 'text',
+      content_text: 'Is this in stock?',
+      inbound_payload: msg,
+    })
+  })
+
+  it('leaves inbound_payload empty for plain text', async () => {
+    await runWebhook()
+
+    expect(h.state.upsertCalls[0].row.inbound_payload).toBeNull()
+  })
+
+  it('keeps the raw payload of a type the webhook does not recognise', async () => {
+    const msg = {
+      ...base,
+      id: 'wamid.UNK1',
+      type: 'unsupported',
+      errors: [{ code: 131051, title: 'Message type unknown', error_data: { details: 'Message type is not currently supported' } }],
+    }
+    await runWebhook(msg)
+
+    expect(h.state.upsertCalls[0].row).toMatchObject({
+      content_type: 'text',
+      content_text: '[Unsupported message type: unsupported] Message type is not currently supported',
+      inbound_payload: msg,
+    })
+  })
+})
+
 describe('inbound webhook: inbound media is mirrored (#466)', () => {
   const IMAGE_MESSAGE = {
     id: 'wamid.IMG1',

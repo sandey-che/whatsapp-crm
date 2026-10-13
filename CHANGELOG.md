@@ -9,6 +9,25 @@ Versions follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Pre-1.0, `MINOR` bumps cover new modules; `PATCH` bumps cover bug fixes
 and polish.
 
+## [Unreleased]
+
+> **Migration required:** apply `supabase/migrations/049_inbound_message_payload.sql`
+> (adds `messages.inbound_payload` and allows `content_type = 'order'`).
+> Deploy the migration **before** the app — the webhook writes the new
+> column and value, and would fail to insert inbound messages without it.
+
+### Fixed
+
+- **Catalog orders lost as "[Unsupported message type: order]".** A
+  customer submitting a cart from the catalog now lands in the inbox as an
+  order card (products, quantities, prices, total, note), with a readable
+  summary for the conversation preview, automations and the AI auto-reply.
+  Shared contacts, WhatsApp Flow form responses, product enquiries and
+  click-to-ad referrals are kept too, and any message type the webhook
+  doesn't recognise now stores Meta's raw payload instead of discarding
+  it. The public API's `Message` and the `message.received` webhook carry
+  the structured payload (`inbound_payload` / `payload`).
+
 ## [0.8.1] — 2026-07-10
 
 Fixes inbound chats fragmenting into multiple threads for the same

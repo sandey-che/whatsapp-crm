@@ -808,7 +808,7 @@ components:
         content_type:
           type: string
           example: text
-          description: e.g. `text`, `image`, `video`, `document`, `audio`, `template`, `interactive`.
+          description: e.g. `text`, `image`, `video`, `document`, `audio`, `location`, `template`, `interactive`, `order`.
         content_text: { type: [string, "null"] }
         media_url: { type: [string, "null"] }
         template_name: { type: [string, "null"] }
@@ -822,6 +822,13 @@ components:
         interactive_reply_id:
           type: [string, "null"]
           description: For an inbound interactive reply, the button/row `id` the contact chose.
+        inbound_payload:
+          type: [object, "null"]
+          description: |
+            The raw WhatsApp Cloud API message for inbound content that `content_text` only summarises —
+            catalog orders (`order.product_items`), shared contacts, WhatsApp Flow form responses,
+            product enquiries (`context.referred_product`), ad referrals (`referral`) and unrecognised
+            message types. Null for plain text and media.
         created_at: { type: string, format: date-time }
 
     SendMessageRequest:
@@ -1067,6 +1074,9 @@ components:
                 whatsapp_message_id: { type: string }
                 content_type: { type: string, example: text }
                 text: { type: [string, "null"] }
+                payload:
+                  type: [object, "null"]
+                  description: Raw WhatsApp message for structured content (e.g. an order's cart); see `Message.inbound_payload`.
             - title: message.status_updated
               type: object
               properties:

@@ -1,5 +1,6 @@
 import type { AccountRole } from "@/lib/auth/roles";
 import type { InteractiveMessagePayload } from "@/lib/whatsapp/interactive";
+import type { InboundMessagePayload } from "@/lib/whatsapp/inbound-structured";
 
 export type {
   InteractiveMessagePayload,
@@ -226,7 +227,9 @@ export type ContentType =
   | 'location'
   | 'template'
   /** Customer tapped a reply button or list row on a message we sent. */
-  | 'interactive';
+  | 'interactive'
+  /** Customer submitted a cart from the catalog. Migration 049. */
+  | 'order';
 export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 
 export interface Message {
@@ -262,6 +265,14 @@ export interface Message {
    * 'interactive'` and `sender_type` is agent/bot. Migration 035.
    */
   interactive_payload?: InteractiveMessagePayload;
+  /**
+   * The raw Meta message for INBOUND content that `content_text` only
+   * summarises: catalog orders (`.order`), shared contacts, Flow form
+   * responses, product enquiries (`.context.referred_product`), ad
+   * referrals (`.referral`) and unrecognised types. Null for plain text
+   * and media. Migration 049.
+   */
+  inbound_payload?: InboundMessagePayload | null;
   /**
    * True when the AI auto-reply bot generated + sent this message (as
    * opposed to a human agent or a deterministic Flow/automation send,

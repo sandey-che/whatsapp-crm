@@ -43,6 +43,8 @@ export interface ApiMessage {
   status: string;
   reply_to_message_id: string | null;
   interactive_reply_id: string | null;
+  /** Raw Meta message for orders, shared contacts, etc. (migration 049). */
+  inbound_payload: Record<string, unknown> | null;
   created_at: string;
 }
 
@@ -95,6 +97,7 @@ export function serializeMessage(m: Message): ApiMessage {
     status: m.status,
     reply_to_message_id: m.reply_to_message_id ?? null,
     interactive_reply_id: m.interactive_reply_id ?? null,
+    inbound_payload: m.inbound_payload ?? null,
     created_at: m.created_at,
   };
 }
